@@ -493,43 +493,113 @@ export async function getDepth() {
   return { success: true, bid_levels: data.bids?.length || 0, ask_levels: data.asks?.length || 0, spread: data.spread, bids: data.bids || [], asks: data.asks || [], raw_values: data.raw_values, note: data.note };
 }
 
+// Pure, read-only extraction of {id, name, inputs, values} from a raw
+// dataSources() array. Kept dependency-free (no closures over outer scope)
+// so it can run unmodified both here (unit tests, via direct import) and
+// inside the page via `.toString()` injection in getStudyValues() below —
+// the exact logic under test is what executes against the live chart.
+//
+// TradingView Desktop 3.3.0 changed the runtime shape of some data sources:
+// source.metaInfo() can throw or return nothing even though the source is a
+// real study, while `_studyMetaInfo` still carries description/id/inputs.
+// metaInfo() is tried first (legacy path, unchanged behavior); `_studyMetaInfo`
+// is only consulted as a fallback when metaInfo() is unusable. Values are
+// still read from dataWindowView().items() first; valuesProvider /
+// legendValuesProvider are only used as a last resort, and only when their
+// resolved shape matches a recognized items-list (title/value pairs) — an
+// unrecognized shape is skipped rather than guessed at.
+export function buildStudyResults(sources) {
+  function resolveMeta(s) {
+    var meta = null;
+    if (typeof s.metaInfo === 'function') {
+      try { meta = s.metaInfo(); } catch (e) { meta = null; }
+    }
+    if (meta && (meta.description || meta.shortDescription)) return meta;
+    var fallback = null;
+    try { fallback = s._studyMetaInfo; } catch (e) { fallback = null; }
+    if (typeof fallback === 'function') {
+      try { fallback = fallback(); } catch (e) { fallback = null; }
+    }
+    if (fallback && (fallback.description || fallback.shortDescription)) return fallback;
+    return null;
+  }
+
+  function valuesFromItems(items) {
+    var values = {};
+    if (!items) return values;
+    for (var i = 0; i < items.length; i++) {
+      var item = items[i];
+      if (!item) continue;
+      var title = item._title != null ? item._title : item.title;
+      var value = item._value != null ? item._value : item.value;
+      var hasTitle = title != null && title !== '';
+      var hasValue = value != null && value !== '' && value !== '∅';
+      if (hasTitle && hasValue) values[title] = value;
+    }
+    return values;
+  }
+
+  function itemsFromCandidate(candidate) {
+    if (candidate && typeof candidate.value === 'function') {
+      try { candidate = candidate.value(); } catch (e) { candidate = null; }
+    }
+    if (Array.isArray(candidate)) return candidate;
+    if (candidate && typeof candidate.items === 'function') {
+      try { var it = candidate.items(); return Array.isArray(it) ? it : null; } catch (e) { return null; }
+    }
+    return null;
+  }
+
+  function valuesFromProvider(s, providerName) {
+    var raw = s[providerName];
+    if (raw == null) return {};
+    var resolved = raw;
+    if (typeof raw === 'function') {
+      try { resolved = raw.call(s); } catch (e) { resolved = null; }
+    }
+    return valuesFromItems(itemsFromCandidate(resolved));
+  }
+
+  var results = [];
+  for (var si = 0; si < sources.length; si++) {
+    var s = sources[si];
+    var meta = resolveMeta(s);
+    if (!meta) continue;
+    var name = meta.description || meta.shortDescription || '';
+    if (!name) continue;
+
+    var values = {};
+    try {
+      var dwv = typeof s.dataWindowView === 'function' ? s.dataWindowView() : null;
+      if (dwv) values = valuesFromItems(typeof dwv.items === 'function' ? dwv.items() : null);
+    } catch (e) { values = {}; }
+
+    if (Object.keys(values).length === 0) values = valuesFromProvider(s, 'valuesProvider');
+    if (Object.keys(values).length === 0) values = valuesFromProvider(s, 'legendValuesProvider');
+    if (Object.keys(values).length === 0) continue;
+
+    // Include id + inputs so multiple instances of the same indicator
+    // (e.g. two EMAs with different lengths) are distinguishable (#143).
+    var id = null;
+    try { id = typeof s.id === 'function' ? s.id() : null; } catch (e) {}
+    var inputs = null;
+    try {
+      var ip = typeof s.inputs === 'function' ? s.inputs() : null;
+      if (ip && Object.keys(ip).length) inputs = ip;
+    } catch (e) {}
+
+    results.push({ id: id, name: name, inputs: inputs, values: values });
+  }
+  return results;
+}
+
 export async function getStudyValues() {
   const data = await evaluate(`
     (function() {
       var chart = window.TradingViewApi._activeChartWidgetWV.value()._chartWidget;
       var model = chart.model();
       var sources = model.model().dataSources();
-      var results = [];
-      for (var si = 0; si < sources.length; si++) {
-        var s = sources[si];
-        if (!s.metaInfo) continue;
-        try {
-          var meta = s.metaInfo();
-          var name = meta.description || meta.shortDescription || '';
-          if (!name) continue;
-          var values = {};
-          try {
-            var dwv = s.dataWindowView();
-            if (dwv) {
-              var items = dwv.items();
-              if (items) {
-                for (var i = 0; i < items.length; i++) {
-                  var item = items[i];
-                  if (item._value && item._value !== '∅' && item._title) values[item._title] = item._value;
-                }
-              }
-            }
-          } catch(e) {}
-          // Include id + inputs so multiple instances of the same indicator
-          // (e.g. two EMAs with different lengths) are distinguishable (#143).
-          var id = null;
-          try { id = s.id ? s.id() : null; } catch(e) {}
-          var inputs = null;
-          try { var ip = s.inputs ? s.inputs() : null; if (ip && Object.keys(ip).length) inputs = ip; } catch(e) {}
-          if (Object.keys(values).length > 0) results.push({ id: id, name: name, inputs: inputs, values: values });
-        } catch(e) {}
-      }
-      return results;
+      return (${buildStudyResults.toString()})(sources);
     })()
   `);
   return { success: true, study_count: data?.length || 0, studies: data || [] };

@@ -134,29 +134,29 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ count, summary } = {}) {
-  const limit = Math.min(count || 100, MAX_OHLCV_BARS);
-  let data;
-  try {
-    data = await evaluate(`
-      (function() {
-        var bars = ${BARS_PATH};
-        if (!bars || typeof bars.lastIndex !== 'function') return null;
-        var result = [];
-        var end = bars.lastIndex();
-        var start = Math.max(bars.firstIndex(), end - ${limit} + 1);
-        for (var i = start; i <= end; i++) {
-          var v = bars.valueAt(i);
-          if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
-        }
-        return {bars: result, total_bars: bars.size(), source: 'direct_bars'};
-      })()
-    `);
-  } catch { data = null; }
-
+// Builds the getOhlcv() tool payload from one atomic page-side extraction.
+// `data.chart` (symbol/resolution/chart type) and `data.bars` are read inside
+// the SAME Runtime.evaluate from the SAME active chart widget object, so the
+// identity is transactionally bound to the bars it describes. Exported as a
+// pure function so it can be unit-tested without CDP (see
+// tests/ohlcv_identity.test.js, same pattern as buildStudyResults()).
+export function buildOhlcvResult(data, { summary } = {}) {
   if (!data || !data.bars || data.bars.length === 0) {
     throw new Error('Could not extract OHLCV data. The chart may still be loading.');
   }
+
+  const identity = data.chart;
+  if (!identity
+    || typeof identity.symbol !== 'string' || identity.symbol.length === 0
+    || typeof identity.resolution !== 'string' || identity.resolution.length === 0
+    || !Number.isInteger(identity.chart_type)) {
+    throw new Error('Could not read chart identity (symbol/resolution/chart type) for OHLCV data.');
+  }
+  const chart = {
+    symbol: identity.symbol,
+    resolution: identity.resolution,
+    chart_type: identity.chart_type,
+  };
 
   if (summary) {
     const bars = data.bars;
@@ -166,7 +166,7 @@ export async function getOhlcv({ count, summary } = {}) {
     const first = bars[0];
     const last = bars[bars.length - 1];
     return {
-      success: true, bar_count: bars.length,
+      success: true, chart, bar_count: bars.length,
       period: { from: first.time, to: last.time },
       open: first.open, close: last.close,
       high: Math.max(...highs), low: Math.min(...lows),
@@ -178,7 +178,41 @@ export async function getOhlcv({ count, summary } = {}) {
     };
   }
 
-  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+  return { success: true, chart, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+}
+
+export async function getOhlcv({ count, summary } = {}) {
+  const limit = Math.min(count || 100, MAX_OHLCV_BARS);
+  let data;
+  try {
+    data = await evaluate(`
+      (function() {
+        var chart = ${CHART_API};
+        if (!chart) return null;
+        var identity;
+        try {
+          identity = {
+            symbol: chart.symbol(),
+            resolution: chart.resolution(),
+            chart_type: chart.chartType()
+          };
+        } catch (e) { return null; }
+        var bars;
+        try { bars = chart._chartWidget.model().mainSeries().bars(); } catch (e) { return null; }
+        if (!bars || typeof bars.lastIndex !== 'function') return null;
+        var result = [];
+        var end = bars.lastIndex();
+        var start = Math.max(bars.firstIndex(), end - ${limit} + 1);
+        for (var i = start; i <= end; i++) {
+          var v = bars.valueAt(i);
+          if (v) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+        }
+        return {chart: identity, bars: result, total_bars: bars.size(), source: 'direct_bars_with_identity'};
+      })()
+    `);
+  } catch { data = null; }
+
+  return buildOhlcvResult(data, { summary });
 }
 
 export async function getIndicator({ entity_id }) {

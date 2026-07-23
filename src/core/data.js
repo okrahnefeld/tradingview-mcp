@@ -1,11 +1,20 @@
 /**
  * Core data access logic.
  */
-import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
+import {
+  evaluate,
+  evaluateAsync,
+  evaluateSingleRuntimeRead,
+  KNOWN_PATHS,
+  safeString,
+} from '../connection.js';
 import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
+export const MAX_STUDY_HISTORY_COUNT = 500;
+export const MAX_STUDY_HISTORY_PLOTS = 16;
+export const MAX_STUDY_HISTORY_ID_LENGTH = 128;
 
 // Round to 8 dp — enough to kill float noise (29899.999999997 → 29900) without
 // destroying precision on forex/crypto prices. The old 2-dp rounding flattened
@@ -213,6 +222,543 @@ export async function getOhlcv({ count, summary } = {}) {
   } catch { data = null; }
 
   return buildOhlcvResult(data, { summary });
+}
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function requireBoundedId(value, name) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`${name} must be a non-empty string.`);
+  }
+  if (value.length > MAX_STUDY_HISTORY_ID_LENGTH) {
+    throw new Error(`${name} must be at most ${MAX_STUDY_HISTORY_ID_LENGTH} characters.`);
+  }
+  return value;
+}
+
+/**
+ * Strict, dependency-free request validation for callers below the MCP/Zod
+ * boundary. No coercion or implicit study/plot selection is permitted.
+ */
+export function normalizeStudyHistoryRequest(request) {
+  if (!isRecord(request)) throw new Error('Study history request must be an object.');
+
+  const allowedKeys = new Set(['entity_id', 'plot_ids', 'count', 'include_ohlcv']);
+  const extraKeys = Object.keys(request).filter(key => !allowedKeys.has(key));
+  if (extraKeys.length > 0) {
+    throw new Error(`Unknown study history argument(s): ${extraKeys.join(', ')}.`);
+  }
+
+  const entity_id = requireBoundedId(request.entity_id, 'entity_id');
+  if (!Array.isArray(request.plot_ids)
+    || request.plot_ids.length < 1
+    || request.plot_ids.length > MAX_STUDY_HISTORY_PLOTS) {
+    throw new Error(`plot_ids must contain between 1 and ${MAX_STUDY_HISTORY_PLOTS} entries.`);
+  }
+
+  const plot_ids = request.plot_ids.map((plotId, index) => (
+    requireBoundedId(plotId, `plot_ids[${index}]`)
+  ));
+  if (new Set(plot_ids).size !== plot_ids.length) {
+    throw new Error('plot_ids must not contain duplicates.');
+  }
+
+  if (!Number.isInteger(request.count)
+    || request.count < 1
+    || request.count > MAX_STUDY_HISTORY_COUNT) {
+    throw new Error(`count must be an integer between 1 and ${MAX_STUDY_HISTORY_COUNT}.`);
+  }
+  if (typeof request.include_ohlcv !== 'boolean') {
+    throw new Error('include_ohlcv must be a boolean.');
+  }
+
+  return { entity_id, plot_ids, count: request.count, include_ohlcv: request.include_ohlcv };
+}
+
+function validateChartIdentity(identity) {
+  if (!isRecord(identity)
+    || typeof identity.symbol !== 'string' || identity.symbol.trim().length === 0
+    || typeof identity.resolution !== 'string' || identity.resolution.trim().length === 0
+    || !Number.isInteger(identity.chart_type)) {
+    throw new Error('Could not read a valid atomic chart identity (symbol/resolution/chart type).');
+  }
+  return {
+    symbol: identity.symbol,
+    resolution: identity.resolution,
+    chart_type: identity.chart_type,
+  };
+}
+
+function chartIdentitiesEqual(left, right) {
+  return left.symbol === right.symbol
+    && left.resolution === right.resolution
+    && left.chart_type === right.chart_type;
+}
+
+function nullableMetadataString(value, name) {
+  if (value == null) return null;
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new Error(`Study ${name} is malformed.`);
+  }
+  return value;
+}
+
+function nullableMetadataVersion(value) {
+  if (value == null) return null;
+  if ((typeof value !== 'string' && typeof value !== 'number')
+    || (typeof value === 'string' && value.trim().length === 0)
+    || (typeof value === 'number' && !Number.isFinite(value))) {
+    throw new Error('Study meta_version is malformed.');
+  }
+  return value;
+}
+
+function validateUnixTime(time, context) {
+  // Bound to the commonly representable proleptic-Gregorian Unix range.
+  // Millisecond epochs (currently ~1e12) are therefore rejected rather than
+  // being mislabeled as seconds.
+  if (!Number.isInteger(time) || time < -62167219200 || time > 253402300799) {
+    throw new Error(`${context} time must be an integer Unix timestamp in seconds.`);
+  }
+  return time;
+}
+
+function normalizeStudyValue(value, plotId, time) {
+  if (value == null) return null;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  throw new Error(`Study value for plot ${plotId} at ${time} must be finite numeric, boolean, or null.`);
+}
+
+function extractStudyMetadata(study, requestedPlotIds) {
+  if (!isRecord(study)) throw new Error('Selected study payload is malformed.');
+  const entity_id = requireBoundedId(study.entity_id, 'study.entity_id');
+  const script_id = nullableMetadataString(study.script_id, 'script_id');
+  const pine_version = nullableMetadataString(study.pine_version, 'pine_version');
+  const description = nullableMetadataString(study.description, 'description');
+  const meta_id = nullableMetadataString(study.meta_id, 'meta_id');
+  const meta_version = nullableMetadataVersion(study.meta_version);
+
+  if (!Array.isArray(study.plots)) throw new Error('Selected study plot metadata is unavailable.');
+  const plotsById = new Map();
+  for (let ordinal = 0; ordinal < study.plots.length; ordinal++) {
+    const plot = study.plots[ordinal];
+    if (!isRecord(plot)) throw new Error('Selected study plot metadata is malformed.');
+    const id = requireBoundedId(plot.id, 'study plot id');
+    if (plotsById.has(id)) throw new Error(`Duplicate plot ID in study metadata: ${id}.`);
+    if (plot.ordinal !== ordinal) {
+      throw new Error(`Plot ordinal for ${id} does not match its metaInfo.plots position.`);
+    }
+    if (plot.type != null && typeof plot.type !== 'string') {
+      throw new Error(`Plot type for ${id} is malformed.`);
+    }
+    if (plot.target != null && typeof plot.target !== 'string') {
+      throw new Error(`Plot target for ${id} is malformed.`);
+    }
+    if (plot.title != null && typeof plot.title !== 'string') {
+      throw new Error(`Plot title for ${id} is malformed.`);
+    }
+    plotsById.set(id, {
+      ordinal,
+      id,
+      type: plot.type ?? null,
+      target: plot.target ?? null,
+      title: plot.title ?? null,
+    });
+  }
+
+  const plots = requestedPlotIds.map((id) => {
+    const plot = plotsById.get(id);
+    if (!plot) throw new Error(`Requested plot ID not found in selected study: ${id}.`);
+    return plot;
+  });
+
+  return {
+    study: {
+      entity_id,
+      script_id,
+      pine_version,
+      description,
+      meta_id,
+      meta_version,
+    },
+    plots,
+  };
+}
+
+/**
+ * Convert adapter rows that already share one native TradingView time index
+ * into strict, ordered response rows. A missing property is an explicit null;
+ * falsy values (0 and false) are preserved.
+ */
+export function extractHistoricalStudyRows(rows, requestedPlotIds) {
+  if (!Array.isArray(rows)) throw new Error('Historical study rows are unavailable.');
+  const seenTimes = new Set();
+  const normalized = rows.map((row) => {
+    if (!isRecord(row) || !isRecord(row.values)) throw new Error('Historical study row is malformed.');
+    const time = validateUnixTime(row.time, 'Study row');
+    if (seenTimes.has(time)) throw new Error(`Duplicate study timestamp: ${time}.`);
+    seenTimes.add(time);
+
+    const values = {};
+    for (const plotId of requestedPlotIds) {
+      const value = Object.prototype.hasOwnProperty.call(row.values, plotId)
+        ? row.values[plotId]
+        : null;
+      values[plotId] = normalizeStudyValue(value, plotId, time);
+    }
+    return { time, values };
+  });
+  normalized.sort((a, b) => a.time - b.time);
+  return normalized;
+}
+
+function normalizeOhlcvRow(row) {
+  if (!isRecord(row)) throw new Error('OHLCV row is malformed.');
+  const time = validateUnixTime(row.time, 'OHLCV row');
+  for (const field of ['open', 'high', 'low', 'close']) {
+    if (typeof row[field] !== 'number' || !Number.isFinite(row[field])) {
+      throw new Error(`OHLCV ${field} at ${time} must be numeric.`);
+    }
+  }
+  if (row.high < Math.max(row.open, row.close, row.low)) {
+    throw new Error(`OHLCV high invariant failed at ${time}.`);
+  }
+  if (row.low > Math.min(row.open, row.close, row.high)) {
+    throw new Error(`OHLCV low invariant failed at ${time}.`);
+  }
+  if (row.volume != null
+    && (typeof row.volume !== 'number' || !Number.isFinite(row.volume) || row.volume < 0)) {
+    throw new Error(`OHLCV volume at ${time} must be non-negative numeric or null.`);
+  }
+  return {
+    time,
+    open: row.open,
+    high: row.high,
+    low: row.low,
+    close: row.close,
+    volume: row.volume ?? null,
+  };
+}
+
+/** Align OHLCV by exact native timestamps; never shifts rows by position. */
+export function extractAlignedOhlcvRows(rows, studyRows) {
+  if (!Array.isArray(rows)) throw new Error('Atomic OHLCV rows are unavailable.');
+  const byTime = new Map();
+  for (const row of rows) {
+    if (!isRecord(row)) throw new Error('OHLCV row is malformed.');
+    const time = validateUnixTime(row.time, 'OHLCV row');
+    if (byTime.has(time)) throw new Error(`Duplicate OHLCV timestamp: ${time}.`);
+    byTime.set(time, row);
+  }
+
+  return studyRows.map(({ time }) => {
+    if (!byTime.has(time)) throw new Error(`Missing OHLCV row for study timestamp: ${time}.`);
+    return normalizeOhlcvRow(byTime.get(time));
+  });
+}
+
+function normalizeOhlcvRows(rows) {
+  if (!Array.isArray(rows)) throw new Error('Atomic OHLCV rows are unavailable.');
+  const normalized = [];
+  const byTime = new Map();
+  for (const row of rows) {
+    const value = normalizeOhlcvRow(row);
+    if (byTime.has(value.time)) throw new Error(`Duplicate OHLCV timestamp: ${value.time}.`);
+    normalized.push(value);
+    byTime.set(value.time, value);
+  }
+  normalized.sort((a, b) => a.time - b.time);
+  return { normalized, byTime };
+}
+
+function validateAtomicSnapshot(snapshot) {
+  if (!isRecord(snapshot.atomic_context)) {
+    throw new Error('Atomic study history context is unavailable.');
+  }
+  const atomic = snapshot.atomic_context;
+  if (atomic.runtime_read_count !== 1) {
+    throw new Error('Atomic study history snapshot must use exactly one runtime read.');
+  }
+  if (atomic.synchronous !== true) {
+    throw new Error('Atomic study history snapshot must be synchronous.');
+  }
+  if (atomic.same_active_chart_object !== true) {
+    throw new Error('Active chart object changed during the atomic study history read.');
+  }
+  if (atomic.identity_stable !== true) {
+    throw new Error('Chart identity was not stable during the atomic study history read.');
+  }
+
+  const identityBefore = validateChartIdentity(snapshot.identity_before);
+  const identityAfter = validateChartIdentity(snapshot.identity_after);
+  if (!chartIdentitiesEqual(identityBefore, identityAfter)) {
+    throw new Error('Chart identity changed during the atomic study history read.');
+  }
+  const chart = validateChartIdentity(snapshot.chart);
+  if (!chartIdentitiesEqual(chart, identityBefore)) {
+    throw new Error('Atomic chart identity does not match the pre-read identity.');
+  }
+  return {
+    chart,
+    atomic_context: {
+      runtime_read_count: atomic.runtime_read_count,
+      synchronous: atomic.synchronous,
+      same_active_chart_object: atomic.same_active_chart_object,
+      identity_stable: atomic.identity_stable,
+    },
+  };
+}
+
+/**
+ * Pure payload builder for one adapter snapshot. `snapshot.chart`,
+ * `snapshot.studies`, and `snapshot.ohlcv_rows` must all originate from the
+ * same synchronous Runtime read window; this function performs no fallback
+ * reads and fails closed on ambiguity or malformed identity.
+ */
+export function buildStudyHistoryResult(snapshot, request) {
+  const normalizedRequest = normalizeStudyHistoryRequest(request);
+  if (!isRecord(snapshot)) throw new Error('Atomic study history snapshot is unavailable.');
+  const { chart, atomic_context } = validateAtomicSnapshot(snapshot);
+  if (!Array.isArray(snapshot.studies)) throw new Error('Study sources are unavailable in the atomic snapshot.');
+
+  const matches = snapshot.studies.filter(study => (
+    isRecord(study) && study.entity_id === normalizedRequest.entity_id
+  ));
+  if (matches.length === 0) throw new Error(`Study not found: ${normalizedRequest.entity_id}.`);
+  if (matches.length > 1) throw new Error(`Multiple studies found for entity_id: ${normalizedRequest.entity_id}.`);
+
+  const selectedStudy = matches[0];
+  const metadata = extractStudyMetadata(selectedStudy, normalizedRequest.plot_ids);
+  const loadedStudyRows = extractHistoricalStudyRows(selectedStudy.rows, normalizedRequest.plot_ids);
+
+  let usableStudyRows = loadedStudyRows;
+  let normalizedOhlcvRows = null;
+  let alignedLoadedCount = null;
+  if (normalizedRequest.include_ohlcv) {
+    const normalizedOhlcv = normalizeOhlcvRows(snapshot.ohlcv_rows);
+    normalizedOhlcvRows = normalizedOhlcv.normalized;
+    usableStudyRows = loadedStudyRows.filter(row => normalizedOhlcv.byTime.has(row.time));
+    alignedLoadedCount = usableStudyRows.length;
+  } else if (Array.isArray(snapshot.ohlcv_rows)) {
+    normalizedOhlcvRows = normalizeOhlcvRows(snapshot.ohlcv_rows).normalized;
+  }
+
+  const study_rows = usableStudyRows.slice(-normalizedRequest.count);
+  let ohlcv_rows = null;
+  if (normalizedRequest.include_ohlcv) {
+    const selectedTimes = new Set(study_rows.map(row => row.time));
+    ohlcv_rows = normalizedOhlcvRows.filter(row => selectedTimes.has(row.time));
+  }
+  const loadedCount = usableStudyRows.length;
+
+  return {
+    success: true,
+    chart,
+    atomic_context,
+    study: metadata.study,
+    plots: metadata.plots,
+    study_rows,
+    ohlcv_rows,
+    history: {
+      scope: 'currently_loaded_runtime_data',
+      global_history_complete_known: false,
+      study_loaded_count: loadedStudyRows.length,
+      ohlcv_loaded_count: normalizedOhlcvRows?.length ?? null,
+      aligned_loaded_count: alignedLoadedCount,
+    },
+    loaded_count: loadedCount,
+    returned_count: study_rows.length,
+    truncated: loadedCount > study_rows.length,
+  };
+}
+
+/**
+ * Read one complete active-chart snapshot in exactly one synchronous page-side
+ * evaluation. All accesses in the IIFE are read-only; no history loading,
+ * chart navigation, crosshair, or Data Window state is used.
+ */
+export async function readAtomicStudyHistorySnapshot(
+  request,
+  { runtimeEvaluate = evaluateSingleRuntimeRead } = {},
+) {
+  const normalizedRequest = normalizeStudyHistoryRequest(request);
+  if (typeof runtimeEvaluate !== 'function') throw new Error('Single-read runtime evaluator is unavailable.');
+
+  const snapshot = await runtimeEvaluate(`
+    (function() {
+      var entityId = ${safeString(normalizedRequest.entity_id)};
+      var requestedPlotIds = ${JSON.stringify(normalizedRequest.plot_ids)};
+      var activeChartBefore = ${CHART_API};
+      if (!activeChartBefore || !activeChartBefore._chartWidget) {
+        throw new Error('Active chart object is unavailable.');
+      }
+
+      function readIdentity(chart) {
+        return {
+          symbol: chart.symbol(),
+          resolution: chart.resolution(),
+          chart_type: chart.chartType()
+        };
+      }
+      function identitiesEqual(left, right) {
+        return left.symbol === right.symbol
+          && left.resolution === right.resolution
+          && left.chart_type === right.chart_type;
+      }
+
+      var identityBefore = readIdentity(activeChartBefore);
+      var chartModel = activeChartBefore._chartWidget.model();
+      var sources = chartModel.model().dataSources();
+      if (!Array.isArray(sources)) throw new Error('Active chart data sources are unavailable.');
+
+      var matches = [];
+      for (var sourceIndex = 0; sourceIndex < sources.length; sourceIndex++) {
+        var source = sources[sourceIndex];
+        if (source && typeof source.id === 'function' && source.id() === entityId) {
+          matches.push(source);
+        }
+      }
+      if (matches.length === 0) throw new Error('Study not found: ' + entityId + '.');
+      if (matches.length > 1) throw new Error('Multiple studies found for entity_id: ' + entityId + '.');
+
+      var studies = [];
+      for (var matchIndex = 0; matchIndex < matches.length; matchIndex++) {
+        var study = matches[matchIndex];
+        var inputs = study.inputs();
+        var metaInfo = study.metaInfo();
+        if (!inputs || typeof inputs !== 'object') throw new Error('Selected study inputs are unavailable.');
+        if (!metaInfo || typeof metaInfo !== 'object') throw new Error('Selected study MetaInfo is unavailable.');
+        if (!Array.isArray(metaInfo.plots)) throw new Error('Selected study plot metadata is unavailable.');
+
+        var plots = [];
+        var requestedOrdinals = [];
+        for (var plotIndex = 0; plotIndex < metaInfo.plots.length; plotIndex++) {
+          var metaPlot = metaInfo.plots[plotIndex];
+          if (!metaPlot || typeof metaPlot !== 'object') throw new Error('Selected study plot metadata is malformed.');
+          plots.push({
+            ordinal: plotIndex,
+            id: metaPlot.id,
+            type: metaPlot.type == null ? null : metaPlot.type,
+            target: metaPlot.target == null ? null : metaPlot.target,
+            title: metaPlot.title == null ? null : metaPlot.title
+          });
+          for (var requestedIndex = 0; requestedIndex < requestedPlotIds.length; requestedIndex++) {
+            if (metaPlot.id === requestedPlotIds[requestedIndex]) {
+              requestedOrdinals[requestedIndex] = plotIndex;
+            }
+          }
+        }
+
+        var studyData = study.data();
+        var plottableRange = studyData && studyData.plottableRange();
+        var items = plottableRange && plottableRange._items;
+        if (!Array.isArray(items)) throw new Error('Historical study rows are unavailable.');
+        var rows = [];
+        for (var itemIndex = 0; itemIndex < items.length; itemIndex++) {
+          var item = items[itemIndex];
+          var raw = item && item.value;
+          if (!Array.isArray(raw)) throw new Error('Historical study row is malformed.');
+          var values = Object.create(null);
+          for (var valueIndex = 0; valueIndex < requestedPlotIds.length; valueIndex++) {
+            var plotId = requestedPlotIds[valueIndex];
+            var ordinal = requestedOrdinals[valueIndex];
+            var rawValue = ordinal == null || raw.length <= ordinal + 1 ? null : raw[ordinal + 1];
+            if (typeof rawValue === 'number' && !Number.isFinite(rawValue)) {
+              throw new Error('Historical study value is not finite.');
+            }
+            values[plotId] = rawValue == null ? null : rawValue;
+          }
+          rows.push({ internal_index: item.index, time: raw[0], values: values });
+        }
+
+        studies.push({
+          entity_id: study.id(),
+          script_id: inputs.pineId == null ? null : inputs.pineId,
+          pine_version: inputs.pineVersion == null ? null : String(inputs.pineVersion),
+          description: metaInfo.description || metaInfo.shortDescription || null,
+          meta_id: metaInfo.id == null ? null : metaInfo.id,
+          meta_version: metaInfo.version == null ? null : metaInfo.version,
+          plots: plots,
+          rows: rows
+        });
+      }
+
+      var bars = chartModel.mainSeries().bars();
+      if (!bars || typeof bars.firstIndex !== 'function'
+        || typeof bars.lastIndex !== 'function' || typeof bars.valueAt !== 'function') {
+        throw new Error('Main-series OHLCV rows are unavailable.');
+      }
+      var ohlcvRows = [];
+      var firstIndex = bars.firstIndex();
+      var lastIndex = bars.lastIndex();
+      for (var barIndex = firstIndex; barIndex <= lastIndex; barIndex++) {
+        var rawBar = bars.valueAt(barIndex);
+        if (!rawBar) continue;
+        if (!Array.isArray(rawBar)) throw new Error('Main-series OHLCV row is malformed.');
+        for (var priceIndex = 1; priceIndex <= 4; priceIndex++) {
+          if (typeof rawBar[priceIndex] !== 'number' || !Number.isFinite(rawBar[priceIndex])) {
+            throw new Error('Main-series OHLCV price is not finite numeric.');
+          }
+        }
+        if (rawBar.length > 5 && rawBar[5] != null
+          && (typeof rawBar[5] !== 'number' || !Number.isFinite(rawBar[5]))) {
+          throw new Error('Main-series OHLCV volume is not finite numeric.');
+        }
+        ohlcvRows.push({
+          time: rawBar[0],
+          open: rawBar[1],
+          high: rawBar[2],
+          low: rawBar[3],
+          close: rawBar[4],
+          volume: rawBar.length > 5 && rawBar[5] != null ? rawBar[5] : null
+        });
+      }
+
+      var activeChartAfter = ${CHART_API};
+      var identityAfter = readIdentity(activeChartAfter);
+      var sameActiveChartObject = activeChartBefore === activeChartAfter;
+      var identityStable = identitiesEqual(identityBefore, identityAfter);
+      return {
+        chart: identityBefore,
+        identity_before: identityBefore,
+        identity_after: identityAfter,
+        atomic_context: {
+          runtime_read_count: 1,
+          synchronous: true,
+          same_active_chart_object: sameActiveChartObject,
+          identity_stable: identityStable
+        },
+        studies: studies,
+        ohlcv_rows: ohlcvRows
+      };
+    })()
+  `);
+
+  if (!isRecord(snapshot) || !Array.isArray(snapshot.studies)) {
+    throw new Error('Atomic study history runtime snapshot is malformed.');
+  }
+  const matches = snapshot.studies.filter(study => (
+    isRecord(study) && study.entity_id === normalizedRequest.entity_id
+  ));
+  if (matches.length !== 1) {
+    throw new Error(matches.length === 0
+      ? `Study not found: ${normalizedRequest.entity_id}.`
+      : `Multiple studies found for entity_id: ${normalizedRequest.entity_id}.`);
+  }
+  requireBoundedId(matches[0].script_id, 'study.script_id');
+  requireBoundedId(matches[0].pine_version, 'study.pine_version');
+  buildStudyHistoryResult(snapshot, normalizedRequest);
+  return snapshot;
+}
+
+export async function getStudyHistory(request, { readAtomicSnapshot = readAtomicStudyHistorySnapshot } = {}) {
+  const normalizedRequest = normalizeStudyHistoryRequest(request);
+  if (typeof readAtomicSnapshot !== 'function') throw new Error('Atomic study history reader is unavailable.');
+  const snapshot = await readAtomicSnapshot(normalizedRequest);
+  return buildStudyHistoryResult(snapshot, normalizedRequest);
 }
 
 export async function getIndicator({ entity_id }) {

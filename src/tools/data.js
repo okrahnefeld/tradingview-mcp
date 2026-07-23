@@ -2,6 +2,21 @@ import { z } from 'zod';
 import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
+const boundedStudyId = (name) => z.string()
+  .min(1, `${name} must not be empty`)
+  .max(core.MAX_STUDY_HISTORY_ID_LENGTH, `${name} is too long`)
+  .refine(value => value.trim().length > 0, `${name} must not be blank`);
+
+export const studyHistoryRequestSchema = z.object({
+  entity_id: boundedStudyId('entity_id'),
+  plot_ids: z.array(boundedStudyId('plot_id'))
+    .min(1)
+    .max(core.MAX_STUDY_HISTORY_PLOTS)
+    .refine(values => new Set(values).size === values.length, 'plot_ids must not contain duplicates'),
+  count: z.number().int().min(1).max(core.MAX_STUDY_HISTORY_COUNT),
+  include_ohlcv: z.boolean(),
+}).strict();
+
 export function registerDataTools(server) {
   server.tool('data_get_ohlcv', 'Get OHLCV bar data plus the chart identity (symbol, resolution, chart type) read atomically from the same chart. Use summary=true for compact stats instead of all bars (saves context).', {
     count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
@@ -82,5 +97,23 @@ export function registerDataTools(server) {
   server.tool('data_get_study_values', 'Get current indicator values from the data window for all visible studies (RSI, MACD, Bollinger Bands, EMAs, custom indicators with plot()).', {}, async () => {
     try { return jsonResult(await core.getStudyValues()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.registerTool('data_get_study_history', {
+    description: 'Read a bounded historical series for explicitly selected stable plot IDs, optionally with timestamp-aligned OHLCV, from one synchronous atomic active-chart runtime snapshot.',
+    inputSchema: studyHistoryRequestSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  }, async (request) => {
+    try {
+      const validated = studyHistoryRequestSchema.parse(request);
+      return jsonResult(await core.getStudyHistory(validated));
+    } catch (err) {
+      return jsonResult({ success: false, error: err.message }, true);
+    }
   });
 }

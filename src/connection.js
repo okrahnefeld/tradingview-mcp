@@ -146,6 +146,28 @@ export async function evaluate(expression, opts = {}) {
   return result.result?.value;
 }
 
+/**
+ * Execute exactly one synchronous Runtime.evaluate for atomic page snapshots.
+ * Unlike getClient(), this deliberately performs no evaluate-based liveness
+ * probe when a client is already cached. A stale client therefore fails closed
+ * instead of retrying a snapshot across multiple runtime reads.
+ */
+export async function evaluateSingleRuntimeRead(expression) {
+  const c = client || await connect();
+  const result = await c.Runtime.evaluate({
+    expression,
+    returnByValue: true,
+    awaitPromise: false,
+  });
+  if (result.exceptionDetails) {
+    const msg = result.exceptionDetails.exception?.description
+      || result.exceptionDetails.text
+      || 'Unknown evaluation error';
+    throw new Error(`JS evaluation error: ${msg}`);
+  }
+  return result.result?.value;
+}
+
 export async function evaluateAsync(expression) {
   return evaluate(expression, { awaitPromise: true });
 }

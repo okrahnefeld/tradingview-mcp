@@ -156,6 +156,10 @@ describe('data_get_study_history — verified atomic success contract', () => {
     assert.equal(result.truncated, false);
     assert.deepEqual(result.pagination, {
       before_time: null,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: false,
       next_before_time: FIRST_PRICE_TIME,
     });
@@ -213,6 +217,11 @@ describe('data_get_study_history — strict request schema', () => {
     ['NaN before_time', request({ before_time: NaN })],
     ['infinite before_time', request({ before_time: Infinity })],
     ['wrong-type before_time', request({ before_time: '1784505600' })],
+    ['zero upper_time', request({ upper_time: 0 })],
+    ['negative upper_time', request({ upper_time: -1 })],
+    ['fractional upper_time', request({ upper_time: 1.5 })],
+    ['wrong-type upper_time', request({ upper_time: '1784505600' })],
+    ['cursor later than universe', request({ before_time: LAST_TIME, upper_time: LAST_TIME - 1 })],
     ['unknown argument', { ...request(), extra: true }],
   ];
 
@@ -226,7 +235,7 @@ describe('data_get_study_history — strict request schema', () => {
   });
 
   it('accepts an optional positive integer before_time without coercion', () => {
-    const value = request({ before_time: LAST_TIME });
+    const value = request({ before_time: LAST_TIME, upper_time: LAST_TIME });
     assert.equal(studyHistoryRequestSchema.safeParse(value).success, true);
     assert.deepEqual(normalizeStudyHistoryRequest(value), value);
   });
@@ -382,6 +391,10 @@ describe('data_get_study_history — native study-time and value semantics', () 
     assert.equal(result.truncated, false);
     assert.deepEqual(result.pagination, {
       before_time: null,
+      upper_time: null,
+      eligible_loaded_count: 0,
+      eligible_oldest_time: null,
+      eligible_newest_time: null,
       has_more_before: false,
       next_before_time: null,
     });
@@ -537,6 +550,10 @@ describe('data_get_study_history — completeness, count, and truncation semanti
     assert.equal(result.truncated, true);
     assert.deepEqual(result.pagination, {
       before_time: null,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: true,
       next_before_time: LAST_TIME - WEEK,
     });
@@ -588,6 +605,10 @@ describe('data_get_study_history — backward timestamp pagination', () => {
     assert.deepEqual(result.ohlcv_rows.map(row => row.time), result.study_rows.map(row => row.time));
     assert.deepEqual(result.pagination, {
       before_time: LAST_TIME,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: true,
       next_before_time: LAST_TIME - 2 * WEEK,
     });
@@ -661,6 +682,7 @@ describe('data_get_study_history — backward timestamp pagination', () => {
       assert.ok(page.returned_count <= MAX_STUDY_HISTORY_COUNT);
       assert.equal(page.returned_count, studyTimes.length);
       assert.equal(page.loaded_count, fixtureRowCount);
+      assert.equal(page.pagination.eligible_loaded_count, fixtureRowCount);
       assert.deepEqual(ohlcvTimes, studyTimes);
       assert.deepEqual([...studyTimes].sort((a, b) => a - b), studyTimes);
       assert.equal(page.pagination.next_before_time, studyTimes[0]);
@@ -687,6 +709,91 @@ describe('data_get_study_history — backward timestamp pagination', () => {
     assert.equal(reassembledStudyRows.length, fixtureRowCount);
     assert.equal(seenTimes.size, fixtureRowCount);
     assert.deepEqual([...seenTimes].sort((a, b) => a - b), studyRows.map(row => row.time));
+  });
+
+  it('keeps a fixed upper-time universe stable when a new tail bar appears', () => {
+    const fixtureRowCount = 2300;
+    const originalRows = makeStudyRows(fixtureRowCount);
+    const upperTime = originalRows.at(-1).time + WEEK;
+    const tailRow = {
+      time: upperTime,
+      values: { plot_5: 1, plot_9: 2, plot_10: 4286683400 },
+    };
+    const originalSnapshot = makeSnapshot({
+      studies: [makeStudy({ rows: originalRows })],
+      ohlcv_rows: originalRows.map(row => makeBar(row.time)),
+    });
+    const grownSnapshot = makeSnapshot({
+      studies: [makeStudy({ rows: [...originalRows, tailRow] })],
+      ohlcv_rows: [...originalRows.map(row => makeBar(row.time)), makeBar(tailRow.time)],
+    });
+    const fixedRequest = request({
+      count: 500,
+      before_time: upperTime,
+      upper_time: upperTime,
+    });
+    const beforeGrowth = buildStudyHistoryResult(originalSnapshot, fixedRequest);
+    const afterGrowth = buildStudyHistoryResult(grownSnapshot, fixedRequest);
+
+    assert.equal(beforeGrowth.loaded_count, fixtureRowCount);
+    assert.equal(afterGrowth.loaded_count, fixtureRowCount + 1);
+    assert.equal(beforeGrowth.pagination.eligible_loaded_count, fixtureRowCount);
+    assert.equal(afterGrowth.pagination.eligible_loaded_count, fixtureRowCount);
+    assert.equal(afterGrowth.pagination.eligible_newest_time, originalRows.at(-1).time);
+    assert.deepEqual(afterGrowth.study_rows, beforeGrowth.study_rows);
+  });
+
+  it('does not let a new bar above the fixed cutoff alter any pagination page', () => {
+    const originalRows = makeStudyRows(2300);
+    const upperTime = originalRows.at(-1).time + WEEK;
+    const tailRow = {
+      time: upperTime,
+      values: { plot_5: 1, plot_9: 2, plot_10: 4286683400 },
+    };
+    const snapshot = makeSnapshot({
+      studies: [makeStudy({ rows: [...originalRows, tailRow] })],
+      ohlcv_rows: [...originalRows.map(row => makeBar(row.time)), makeBar(tailRow.time)],
+    });
+    const pageSizes = [];
+    let reassembled = [];
+    let beforeTime = upperTime;
+
+    do {
+      const page = buildStudyHistoryResult(snapshot, request({
+        count: 500,
+        before_time: beforeTime,
+        upper_time: upperTime,
+      }));
+      assert.equal(page.pagination.eligible_loaded_count, 2300);
+      assert.ok(page.study_rows.every(row => row.time < upperTime));
+      pageSizes.push(page.returned_count);
+      reassembled = [...page.study_rows, ...reassembled];
+      beforeTime = page.pagination.next_before_time;
+      if (!page.pagination.has_more_before) break;
+    } while (true);
+
+    assert.deepEqual(pageSizes, [500, 500, 500, 500, 300]);
+    assert.deepEqual(reassembled, originalRows);
+  });
+
+  it('changes eligible_loaded_count when history drifts inside the fixed universe', () => {
+    const originalRows = makeStudyRows(2300);
+    const upperTime = originalRows.at(-1).time + WEEK;
+    const insertedRow = {
+      time: originalRows.at(-1).time - Math.floor(WEEK / 2),
+      values: { plot_5: 1, plot_9: 2, plot_10: 4286683400 },
+    };
+    const grownRows = [...originalRows, insertedRow];
+    const result = buildStudyHistoryResult(
+      makeSnapshot({
+        studies: [makeStudy({ rows: grownRows })],
+        ohlcv_rows: grownRows.map(row => makeBar(row.time)),
+      }),
+      request({ count: 500, before_time: upperTime, upper_time: upperTime }),
+    );
+
+    assert.equal(result.loaded_count, 2301);
+    assert.equal(result.pagination.eligible_loaded_count, 2301);
   });
 
   it('aligns OHLCV before filtering and never shifts by position', () => {
@@ -728,6 +835,10 @@ describe('data_get_study_history — backward timestamp pagination', () => {
     const full = buildStudyHistoryResult(makeSnapshot(), request({ count: 2 }));
     assert.deepEqual(full.pagination, {
       before_time: null,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: true,
       next_before_time: LAST_TIME - WEEK,
     });
@@ -739,6 +850,10 @@ describe('data_get_study_history — backward timestamp pagination', () => {
     assert.deepEqual(final.study_rows.map(row => row.time), [FIRST_PRICE_TIME, FIRST_PRICE_TIME + WEEK]);
     assert.deepEqual(final.pagination, {
       before_time: FIRST_PRICE_TIME + 2 * WEEK,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: false,
       next_before_time: FIRST_PRICE_TIME,
     });
@@ -751,6 +866,10 @@ describe('data_get_study_history — backward timestamp pagination', () => {
     assert.deepEqual(empty.ohlcv_rows, []);
     assert.deepEqual(empty.pagination, {
       before_time: FIRST_PRICE_TIME,
+      upper_time: null,
+      eligible_loaded_count: 300,
+      eligible_oldest_time: FIRST_PRICE_TIME,
+      eligible_newest_time: LAST_TIME,
       has_more_before: false,
       next_before_time: null,
     });

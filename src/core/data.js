@@ -245,7 +245,14 @@ function requireBoundedId(value, name) {
 export function normalizeStudyHistoryRequest(request) {
   if (!isRecord(request)) throw new Error('Study history request must be an object.');
 
-  const allowedKeys = new Set(['entity_id', 'plot_ids', 'count', 'include_ohlcv', 'before_time']);
+  const allowedKeys = new Set([
+    'entity_id',
+    'plot_ids',
+    'count',
+    'include_ohlcv',
+    'before_time',
+    'upper_time',
+  ]);
   const extraKeys = Object.keys(request).filter(key => !allowedKeys.has(key));
   if (extraKeys.length > 0) {
     throw new Error(`Unknown study history argument(s): ${extraKeys.join(', ')}.`);
@@ -280,9 +287,21 @@ export function normalizeStudyHistoryRequest(request) {
       || request.before_time <= 0)) {
     throw new Error('before_time must be a positive finite integer Unix timestamp in seconds.');
   }
+  if (request.upper_time !== undefined
+    && (!Number.isFinite(request.upper_time)
+      || !Number.isInteger(request.upper_time)
+      || request.upper_time <= 0)) {
+    throw new Error('upper_time must be a positive finite integer Unix timestamp in seconds.');
+  }
+  if (request.before_time !== undefined
+    && request.upper_time !== undefined
+    && request.before_time > request.upper_time) {
+    throw new Error('before_time must not be later than upper_time.');
+  }
 
   const normalized = { entity_id, plot_ids, count: request.count, include_ohlcv: request.include_ohlcv };
   if (request.before_time !== undefined) normalized.before_time = request.before_time;
+  if (request.upper_time !== undefined) normalized.upper_time = request.upper_time;
   return normalized;
 }
 
@@ -555,10 +574,13 @@ export function buildStudyHistoryResult(snapshot, request) {
     normalizedOhlcvRows = normalizeOhlcvRows(snapshot.ohlcv_rows).normalized;
   }
 
-  const eligibleStudyRows = normalizedRequest.before_time === undefined
+  const universeStudyRows = normalizedRequest.upper_time === undefined
     ? usableStudyRows
-    : usableStudyRows.filter(row => row.time < normalizedRequest.before_time);
-  const study_rows = eligibleStudyRows.slice(-normalizedRequest.count);
+    : usableStudyRows.filter(row => row.time < normalizedRequest.upper_time);
+  const pageEligibleStudyRows = normalizedRequest.before_time === undefined
+    ? universeStudyRows
+    : universeStudyRows.filter(row => row.time < normalizedRequest.before_time);
+  const study_rows = pageEligibleStudyRows.slice(-normalizedRequest.count);
   let ohlcv_rows = null;
   if (normalizedRequest.include_ohlcv) {
     const selectedTimes = new Set(study_rows.map(row => row.time));
@@ -588,8 +610,12 @@ export function buildStudyHistoryResult(snapshot, request) {
     truncated: loadedCount > study_rows.length,
     pagination: {
       before_time: normalizedRequest.before_time ?? null,
+      upper_time: normalizedRequest.upper_time ?? null,
+      eligible_loaded_count: universeStudyRows.length,
+      eligible_oldest_time: universeStudyRows[0]?.time ?? null,
+      eligible_newest_time: universeStudyRows.at(-1)?.time ?? null,
       has_more_before: study_rows.length > 0
-        && eligibleStudyRows[0].time < study_rows[0].time,
+        && pageEligibleStudyRows[0].time < study_rows[0].time,
       next_before_time: study_rows[0]?.time ?? null,
     },
   };

@@ -17,7 +17,19 @@ export const studyHistoryRequestSchema = z.object({
   include_ohlcv: z.boolean(),
   before_time: z.number().finite().int().positive().optional()
     .describe('Exclusive Unix timestamp in seconds; return only rows with time < before_time'),
-}).strict();
+  upper_time: z.number().finite().int().positive().optional()
+    .describe('Fixed exclusive Unix timestamp defining the stable pagination universe'),
+}).strict().superRefine((value, context) => {
+  if (value.before_time !== undefined
+    && value.upper_time !== undefined
+    && value.before_time > value.upper_time) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['before_time'],
+      message: 'before_time must not be later than upper_time',
+    });
+  }
+});
 
 export function registerDataTools(server) {
   server.tool('data_get_ohlcv', 'Get OHLCV bar data plus the chart identity (symbol, resolution, chart type) read atomically from the same chart. Use summary=true for compact stats instead of all bars (saves context).', {
@@ -102,7 +114,7 @@ export function registerDataTools(server) {
   });
 
   server.registerTool('data_get_study_history', {
-    description: 'Read a bounded historical series for explicitly selected stable plot IDs, optionally with timestamp-aligned OHLCV and exclusive before_time pagination, from one synchronous atomic active-chart runtime snapshot.',
+    description: 'Read a bounded historical series for explicitly selected stable plot IDs, optionally with timestamp-aligned OHLCV, exclusive before_time pagination, and a fixed exclusive upper_time universe, from one synchronous atomic active-chart runtime snapshot.',
     inputSchema: studyHistoryRequestSchema,
     annotations: {
       readOnlyHint: true,

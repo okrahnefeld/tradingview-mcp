@@ -245,7 +245,7 @@ function requireBoundedId(value, name) {
 export function normalizeStudyHistoryRequest(request) {
   if (!isRecord(request)) throw new Error('Study history request must be an object.');
 
-  const allowedKeys = new Set(['entity_id', 'plot_ids', 'count', 'include_ohlcv']);
+  const allowedKeys = new Set(['entity_id', 'plot_ids', 'count', 'include_ohlcv', 'before_time']);
   const extraKeys = Object.keys(request).filter(key => !allowedKeys.has(key));
   if (extraKeys.length > 0) {
     throw new Error(`Unknown study history argument(s): ${extraKeys.join(', ')}.`);
@@ -274,7 +274,16 @@ export function normalizeStudyHistoryRequest(request) {
     throw new Error('include_ohlcv must be a boolean.');
   }
 
-  return { entity_id, plot_ids, count: request.count, include_ohlcv: request.include_ohlcv };
+  if (request.before_time !== undefined
+    && (!Number.isFinite(request.before_time)
+      || !Number.isInteger(request.before_time)
+      || request.before_time <= 0)) {
+    throw new Error('before_time must be a positive finite integer Unix timestamp in seconds.');
+  }
+
+  const normalized = { entity_id, plot_ids, count: request.count, include_ohlcv: request.include_ohlcv };
+  if (request.before_time !== undefined) normalized.before_time = request.before_time;
+  return normalized;
 }
 
 function validateChartIdentity(identity) {
@@ -546,7 +555,10 @@ export function buildStudyHistoryResult(snapshot, request) {
     normalizedOhlcvRows = normalizeOhlcvRows(snapshot.ohlcv_rows).normalized;
   }
 
-  const study_rows = usableStudyRows.slice(-normalizedRequest.count);
+  const eligibleStudyRows = normalizedRequest.before_time === undefined
+    ? usableStudyRows
+    : usableStudyRows.filter(row => row.time < normalizedRequest.before_time);
+  const study_rows = eligibleStudyRows.slice(-normalizedRequest.count);
   let ohlcv_rows = null;
   if (normalizedRequest.include_ohlcv) {
     const selectedTimes = new Set(study_rows.map(row => row.time));
@@ -571,7 +583,15 @@ export function buildStudyHistoryResult(snapshot, request) {
     },
     loaded_count: loadedCount,
     returned_count: study_rows.length,
+    // Backward-compatible: true whenever this response omits any loaded,
+    // request-usable row, whether because of count or before_time.
     truncated: loadedCount > study_rows.length,
+    pagination: {
+      before_time: normalizedRequest.before_time ?? null,
+      has_more_before: study_rows.length > 0
+        && eligibleStudyRows[0].time < study_rows[0].time,
+      next_before_time: study_rows[0]?.time ?? null,
+    },
   };
 }
 

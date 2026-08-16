@@ -12,6 +12,7 @@ import {
   extractAlignedOhlcvRows,
   extractHistoricalStudyRows,
   getStudyHistory,
+  MAX_STUDY_HISTORY_COUNT,
   normalizeStudyHistoryRequest,
   readAtomicStudyHistorySnapshot,
 } from '../src/core/data.js';
@@ -153,6 +154,11 @@ describe('data_get_study_history — verified atomic success contract', () => {
     assert.equal(result.loaded_count, 300);
     assert.equal(result.returned_count, 300);
     assert.equal(result.truncated, false);
+    assert.deepEqual(result.pagination, {
+      before_time: null,
+      has_more_before: false,
+      next_before_time: FIRST_PRICE_TIME,
+    });
     assert.equal(result.study_rows[0].time, FIRST_PRICE_TIME);
     assert.equal(result.study_rows.at(-1).time, LAST_TIME);
     assert.deepEqual(
@@ -201,6 +207,12 @@ describe('data_get_study_history — strict request schema', () => {
     ['non-integer count', request({ count: 1.5 })],
     ['coercible string count', request({ count: '3' })],
     ['non-boolean include_ohlcv', request({ include_ohlcv: 1 })],
+    ['zero before_time', request({ before_time: 0 })],
+    ['negative before_time', request({ before_time: -1 })],
+    ['fractional before_time', request({ before_time: 1.5 })],
+    ['NaN before_time', request({ before_time: NaN })],
+    ['infinite before_time', request({ before_time: Infinity })],
+    ['wrong-type before_time', request({ before_time: '1784505600' })],
     ['unknown argument', { ...request(), extra: true }],
   ];
 
@@ -211,6 +223,12 @@ describe('data_get_study_history — strict request schema', () => {
       assert.equal(studyHistoryRequestSchema.safeParse(value).success, false, name);
       assert.throws(() => normalizeStudyHistoryRequest(value), undefined, name);
     }
+  });
+
+  it('accepts an optional positive integer before_time without coercion', () => {
+    const value = request({ before_time: LAST_TIME });
+    assert.equal(studyHistoryRequestSchema.safeParse(value).success, true);
+    assert.deepEqual(normalizeStudyHistoryRequest(value), value);
   });
 
   it('preserves requested plot order while retaining actual ordinals', () => {
@@ -362,6 +380,11 @@ describe('data_get_study_history — native study-time and value semantics', () 
     assert.equal(result.loaded_count, 0);
     assert.equal(result.returned_count, 0);
     assert.equal(result.truncated, false);
+    assert.deepEqual(result.pagination, {
+      before_time: null,
+      has_more_before: false,
+      next_before_time: null,
+    });
   });
 
   it('rejects duplicate timestamps and malformed/non-array study rows', () => {
@@ -512,6 +535,11 @@ describe('data_get_study_history — completeness, count, and truncation semanti
     assert.equal(result.loaded_count, 300);
     assert.equal(result.returned_count, 2);
     assert.equal(result.truncated, true);
+    assert.deepEqual(result.pagination, {
+      before_time: null,
+      has_more_before: true,
+      next_before_time: LAST_TIME - WEEK,
+    });
     assert.equal(result.history.global_history_complete_known, false);
   });
 
@@ -544,6 +572,218 @@ describe('data_get_study_history — completeness, count, and truncation semanti
     assert.equal(result.returned_count, 360);
     assert.equal(result.truncated, false);
     assert.equal(result.study_rows[0].time, FIRST_STUDY_TIME);
+  });
+});
+
+describe('data_get_study_history — backward timestamp pagination', () => {
+  it('uses a strict exclusive boundary and keeps every page ascending', () => {
+    const result = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 2, before_time: LAST_TIME }),
+    );
+
+    assert.deepEqual(result.study_rows.map(row => row.time), [LAST_TIME - 2 * WEEK, LAST_TIME - WEEK]);
+    assert.ok(result.study_rows.every(row => row.time < LAST_TIME));
+    assert.ok(!result.study_rows.some(row => row.time === LAST_TIME));
+    assert.deepEqual(result.ohlcv_rows.map(row => row.time), result.study_rows.map(row => row.time));
+    assert.deepEqual(result.pagination, {
+      before_time: LAST_TIME,
+      has_more_before: true,
+      next_before_time: LAST_TIME - 2 * WEEK,
+    });
+  });
+
+  it('chains adjacent pages without timestamp overlap', () => {
+    const first = buildStudyHistoryResult(makeSnapshot(), request({ count: 25 }));
+    const second = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 25, before_time: first.pagination.next_before_time }),
+    );
+    const firstTimes = first.study_rows.map(row => row.time);
+    const secondTimes = second.study_rows.map(row => row.time);
+
+    assert.equal(second.pagination.before_time, first.pagination.next_before_time);
+    assert.equal(new Set([...firstTimes, ...secondTimes]).size, firstTimes.length + secondTimes.length);
+    assert.ok(secondTimes.every(time => time < firstTimes[0]));
+    assert.deepEqual([...firstTimes].sort((a, b) => a - b), firstTimes);
+    assert.deepEqual([...secondTimes].sort((a, b) => a - b), secondTimes);
+  });
+
+  it('reassembles all pages into the exact complete aligned source order', () => {
+    const snapshot = makeSnapshot();
+    const complete = buildStudyHistoryResult(snapshot, request({ count: 500 }));
+    let before_time;
+    let composed = [];
+
+    do {
+      const page = buildStudyHistoryResult(
+        snapshot,
+        request({ count: 73, ...(before_time === undefined ? {} : { before_time }) }),
+      );
+      composed = [...page.study_rows, ...composed];
+      before_time = page.pagination.next_before_time;
+      if (!page.pagination.has_more_before) break;
+    } while (true);
+
+    assert.deepEqual(composed, complete.study_rows);
+    assert.equal(new Set(composed.map(row => row.time)).size, composed.length);
+  });
+
+  it('exports all 2300 loaded aligned rows across 500-row pages without gaps or overlaps', () => {
+    const fixtureRowCount = 2300;
+    const studyRows = makeStudyRows(fixtureRowCount);
+    const ohlcvRows = studyRows.map(row => makeBar(row.time));
+    const snapshot = makeSnapshot({
+      studies: [makeStudy({ rows: studyRows })],
+      ohlcv_rows: ohlcvRows,
+    });
+    const pages = [];
+    const seenTimes = new Set();
+    let reassembledStudyRows = [];
+    let reassembledOhlcvRows = [];
+    let before_time;
+
+    assert.equal(MAX_STUDY_HISTORY_COUNT, 500);
+    assert.equal(studyHistoryRequestSchema.safeParse(request({ count: 500 })).success, true);
+    assert.equal(studyHistoryRequestSchema.safeParse(request({ count: 501 })).success, false);
+
+    do {
+      const page = buildStudyHistoryResult(
+        snapshot,
+        request({
+          count: MAX_STUDY_HISTORY_COUNT,
+          ...(before_time === undefined ? {} : { before_time }),
+        }),
+      );
+      const studyTimes = page.study_rows.map(row => row.time);
+      const ohlcvTimes = page.ohlcv_rows.map(row => row.time);
+
+      assert.ok(page.returned_count <= MAX_STUDY_HISTORY_COUNT);
+      assert.equal(page.returned_count, studyTimes.length);
+      assert.equal(page.loaded_count, fixtureRowCount);
+      assert.deepEqual(ohlcvTimes, studyTimes);
+      assert.deepEqual([...studyTimes].sort((a, b) => a - b), studyTimes);
+      assert.equal(page.pagination.next_before_time, studyTimes[0]);
+      for (const time of studyTimes) {
+        assert.equal(seenTimes.has(time), false, `duplicate timestamp across pages: ${time}`);
+        seenTimes.add(time);
+      }
+
+      pages.push(page);
+      reassembledStudyRows = [...page.study_rows, ...reassembledStudyRows];
+      reassembledOhlcvRows = [...page.ohlcv_rows, ...reassembledOhlcvRows];
+      before_time = page.pagination.next_before_time;
+    } while (pages.at(-1).pagination.has_more_before);
+
+    assert.equal(pages[0].pagination.has_more_before, true);
+    assert.equal(pages.at(-1).pagination.has_more_before, false);
+    assert.deepEqual(pages.map(page => page.returned_count), [500, 500, 500, 500, 300]);
+    assert.deepEqual(
+      pages.map(page => page.pagination.has_more_before),
+      [true, true, true, true, false],
+    );
+    assert.deepEqual(reassembledStudyRows, studyRows);
+    assert.deepEqual(reassembledOhlcvRows, ohlcvRows);
+    assert.equal(reassembledStudyRows.length, fixtureRowCount);
+    assert.equal(seenTimes.size, fixtureRowCount);
+    assert.deepEqual([...seenTimes].sort((a, b) => a - b), studyRows.map(row => row.time));
+  });
+
+  it('aligns OHLCV before filtering and never shifts by position', () => {
+    const rows = makeStudyRows(4);
+    const ohlcv_rows = [
+      makeBar(rows[0].time),
+      makeBar(rows[2].time),
+      makeBar(rows[3].time),
+    ];
+    const result = buildStudyHistoryResult(
+      makeSnapshot({ studies: [makeStudy({ rows })], ohlcv_rows }),
+      request({ count: 2, before_time: rows[3].time }),
+    );
+
+    assert.deepEqual(result.study_rows.map(row => row.time), [rows[0].time, rows[2].time]);
+    assert.deepEqual(result.ohlcv_rows.map(row => row.time), result.study_rows.map(row => row.time));
+    assert.equal(result.history.aligned_loaded_count, 3);
+    assert.equal(result.loaded_count, 3);
+  });
+
+  it('preserves falsy study values on paginated rows', () => {
+    const result = buildStudyHistoryResult(
+      makeSnapshot({ ohlcv_rows: undefined }),
+      request({
+        plot_ids: ['plot_9', 'plot_10'],
+        count: 3,
+        include_ohlcv: false,
+        before_time: LAST_TIME + 1,
+      }),
+    );
+
+    assert.equal(result.study_rows[0].values.plot_10, false);
+    assert.equal(result.study_rows[1].values.plot_9, 0);
+    assert.notEqual(result.study_rows[0].values.plot_10, null);
+    assert.notEqual(result.study_rows[1].values.plot_9, null);
+  });
+
+  it('reports pagination metadata for full, final, and empty pages', () => {
+    const full = buildStudyHistoryResult(makeSnapshot(), request({ count: 2 }));
+    assert.deepEqual(full.pagination, {
+      before_time: null,
+      has_more_before: true,
+      next_before_time: LAST_TIME - WEEK,
+    });
+
+    const final = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 10, before_time: FIRST_PRICE_TIME + 2 * WEEK }),
+    );
+    assert.deepEqual(final.study_rows.map(row => row.time), [FIRST_PRICE_TIME, FIRST_PRICE_TIME + WEEK]);
+    assert.deepEqual(final.pagination, {
+      before_time: FIRST_PRICE_TIME + 2 * WEEK,
+      has_more_before: false,
+      next_before_time: FIRST_PRICE_TIME,
+    });
+
+    const empty = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 10, before_time: FIRST_PRICE_TIME }),
+    );
+    assert.deepEqual(empty.study_rows, []);
+    assert.deepEqual(empty.ohlcv_rows, []);
+    assert.deepEqual(empty.pagination, {
+      before_time: FIRST_PRICE_TIME,
+      has_more_before: false,
+      next_before_time: null,
+    });
+  });
+
+  it('keeps loaded_count global and truncated backward-compatible across pages', () => {
+    const final = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 500, before_time: FIRST_PRICE_TIME + 2 * WEEK }),
+    );
+    const empty = buildStudyHistoryResult(
+      makeSnapshot(),
+      request({ count: 500, before_time: FIRST_PRICE_TIME }),
+    );
+
+    assert.equal(final.loaded_count, 300);
+    assert.equal(final.returned_count, 2);
+    assert.equal(final.pagination.has_more_before, false);
+    assert.equal(final.truncated, true);
+    assert.equal(empty.loaded_count, 300);
+    assert.equal(empty.returned_count, 0);
+    assert.equal(empty.pagination.has_more_before, false);
+    assert.equal(empty.truncated, true);
+  });
+
+  it('reproduces the legacy newest-row selection when before_time is omitted', () => {
+    const result = buildStudyHistoryResult(makeSnapshot(), request({ count: 3 }));
+
+    assert.deepEqual(result.study_rows.map(row => row.time), [LAST_TIME - 2 * WEEK, LAST_TIME - WEEK, LAST_TIME]);
+    assert.equal(result.loaded_count, 300);
+    assert.equal(result.returned_count, 3);
+    assert.equal(result.truncated, true);
+    assert.equal(result.pagination.before_time, null);
   });
 });
 
@@ -645,7 +885,9 @@ async function executeRuntimeAdapter(runtime, requestOverrides = {}) {
 describe('readAtomicStudyHistorySnapshot() — operational offline runtime emulation', () => {
   it('uses one synchronous page read and the verified native containers', async () => {
     const runtime = makeRuntimeFixture();
-    const { snapshot, runtimeReads, expressionSeen } = await executeRuntimeAdapter(runtime);
+    const { snapshot, runtimeReads, expressionSeen } = await executeRuntimeAdapter(runtime, {
+      before_time: LAST_TIME,
+    });
     const plainSnapshot = JSON.parse(JSON.stringify(snapshot));
 
     assert.equal(runtimeReads, 1);
@@ -670,7 +912,7 @@ describe('readAtomicStudyHistorySnapshot() — operational offline runtime emula
     assert.deepEqual(runtime.mutations, []);
     assert.doesNotMatch(
       expressionSeen,
-      /setSymbol|setResolution|requestMoreData|createStudy|removeEntity|setValue|Crosshair|Data Window/,
+      /setSymbol|setResolution|requestMoreData|createStudy|removeEntity|setValue|setVisibleRange|chart_scroll|chart_set_visible_range|Crosshair|crosshair|Data Window/,
     );
   });
 

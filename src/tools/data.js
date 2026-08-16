@@ -15,6 +15,8 @@ export const studyHistoryRequestSchema = z.object({
     .refine(values => new Set(values).size === values.length, 'plot_ids must not contain duplicates'),
   count: z.number().int().min(1).max(core.MAX_STUDY_HISTORY_COUNT),
   include_ohlcv: z.boolean(),
+  before_time: z.number().finite().int().positive().optional()
+    .describe('Exclusive Unix timestamp in seconds; return only rows with time < before_time'),
 }).strict();
 
 export function registerDataTools(server) {
@@ -100,7 +102,7 @@ export function registerDataTools(server) {
   });
 
   server.registerTool('data_get_study_history', {
-    description: 'Read a bounded historical series for explicitly selected stable plot IDs, optionally with timestamp-aligned OHLCV, from one synchronous atomic active-chart runtime snapshot.',
+    description: 'Read a bounded historical series for explicitly selected stable plot IDs, optionally with timestamp-aligned OHLCV and exclusive before_time pagination, from one synchronous atomic active-chart runtime snapshot.',
     inputSchema: studyHistoryRequestSchema,
     annotations: {
       readOnlyHint: true,

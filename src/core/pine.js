@@ -6,7 +6,7 @@
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
 // ── Monaco finder (injected into TV page) ──
-const FIND_MONACO = `
+export const FIND_MONACO = `
   (function findMonacoEditor() {
     var container = document.querySelector('.monaco-editor.pine-editor-monaco');
     if (!container) return null;
@@ -22,8 +22,9 @@ const FIND_MONACO = `
     var current = el[fiberKey];
     for (var d = 0; d < 15; d++) {
       if (!current) break;
-      if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-        var env = current.memoizedProps.value.monacoEnv;
+      var props = current.memoizedProps;
+      var env = props && (props.monacoEnv || (props.value && props.value.monacoEnv));
+      if (env) {
         if (env.editor && typeof env.editor.getEditors === 'function') {
           var editors = env.editor.getEditors();
           if (editors.length > 0) return { editor: editors[0], env: env };

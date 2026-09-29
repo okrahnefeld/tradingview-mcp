@@ -273,16 +273,21 @@ Read `line.new()`, `label.new()`, `table.new()`, `box.new()` output from any vis
 
 | Tool | Step |
 |------|------|
-| `pine_set_source` | 1. Inject code into editor |
-| `pine_smart_compile` | 2. Compile with auto-detection + error check |
+| `pine_get_bound_identity` | Prove the editor's persistent script ID before any mutation |
+| `pine_set_source` | 1. Inject code into editor (requires `expected_script_id`) |
+| `pine_smart_compile` | 2. Compile with auto-detection + error check (requires `expected_script_id`) |
 | `pine_get_errors` | 3. Read compilation errors if any |
 | `pine_get_console` | 4. Read log.info() output |
-| `pine_save` | 5. Save to TradingView cloud |
+| `pine_save` | 5. Save to TradingView cloud (requires `expected_script_id`) |
 | `pine_get_source` | Read current script (**warning: can be 200KB+ for complex scripts**) |
-| `pine_new` | Create blank indicator/strategy/library |
-| `pine_open` / `pine_list_scripts` | Open or list saved scripts |
+| `pine_new` | Request a new indicator/strategy/library; succeeds only after a new persistent ID is proven |
+| `pine_open` / `pine_list_scripts` | Open with binding proof, or list saved scripts (`pine_open` requires the current `expected_script_id`) |
 | `pine_analyze` | Offline static analysis (no chart needed) |
 | `pine_check` | Server-side compile check (no chart needed) |
+
+All Pine mutations fail closed when the bound identity is unproven, differs from
+`expected_script_id`, or is protected by policy. `pine_new` may return
+`TRANSIENT_UNBOUND_BUFFER` when TradingView has not created a persistent object.
 
 ### Replay Mode
 

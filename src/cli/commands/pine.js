@@ -12,6 +12,10 @@ async function readStdin() {
 register('pine', {
   description: 'Pine Script tools',
   subcommands: new Map([
+    ['identity', {
+      description: 'Read the persistent identity currently bound to the Pine editor',
+      handler: () => core.getBoundIdentity(),
+    }],
     ['get', {
       description: 'Get current Pine Script source from editor',
       handler: () => core.getSource(),
@@ -20,6 +24,7 @@ register('pine', {
       description: 'Set Pine Script source (reads stdin or --file)',
       options: {
         file: { type: 'string', short: 'f', description: 'Read source from file' },
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound to the editor' },
       },
       handler: async (opts) => {
         let source;
@@ -29,16 +34,22 @@ register('pine', {
           source = await readStdin();
         }
         if (!source) throw new Error('No source provided. Pipe source via stdin or use --file.');
-        return core.setSource({ source });
+        return core.setSource({ source, expected_script_id: opts['expected-id'] });
       },
     }],
     ['compile', {
       description: 'Smart compile: detect button, compile, check errors',
-      handler: () => core.smartCompile(),
+      options: {
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound to the editor' },
+      },
+      handler: (opts) => core.smartCompile({ expected_script_id: opts['expected-id'] }),
     }],
     ['raw-compile', {
       description: 'Click compile/add button without smart detection',
-      handler: () => core.compile(),
+      options: {
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound to the editor' },
+      },
+      handler: (opts) => core.compile({ expected_script_id: opts['expected-id'] }),
     }],
     ['analyze', {
       description: 'Offline static analysis (no TradingView needed)',
@@ -74,20 +85,36 @@ register('pine', {
     }],
     ['save', {
       description: 'Save the current Pine Script (Ctrl+S)',
-      handler: () => core.save(),
+      options: {
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound to the editor' },
+      },
+      handler: (opts) => core.save({ expected_script_id: opts['expected-id'] }),
     }],
     ['new', {
       description: 'Create a new blank Pine Script (indicator, strategy, library)',
+      options: {
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound before creation' },
+      },
       handler: (opts, positionals) => {
         const type = positionals[0] || 'indicator';
-        return core.newScript({ type });
+        return core.newScript({ type, expected_script_id: opts['expected-id'] });
       },
     }],
     ['open', {
       description: 'Open a saved Pine Script by name',
+      options: {
+        'script-id': { type: 'string', description: 'Persistent script ID to open instead of a name' },
+        'expected-id': { type: 'string', description: 'Required persistent script ID bound before navigation' },
+      },
       handler: (opts, positionals) => {
-        if (!positionals[0]) throw new Error('Script name required. Usage: tv pine open "My Script"');
-        return core.openScript({ name: positionals.join(' ') });
+        if (!positionals[0] && !opts['script-id']) {
+          throw new Error('Script name or --script-id required. Usage: tv pine open "My Script" --expected-id USER;...');
+        }
+        return core.openScript({
+          name: positionals.join(' ') || undefined,
+          script_id: opts['script-id'],
+          expected_script_id: opts['expected-id'],
+        });
       },
     }],
     ['list', {

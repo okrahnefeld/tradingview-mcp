@@ -3,6 +3,11 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/pine.js';
 
 export function registerPineTools(server) {
+  server.tool('pine_get_bound_identity', 'Read the Pine editor binding from persistent platform identity signals. Returns UNPROVEN when identity cannot be established; visible title alone is never accepted.', {}, async () => {
+    try { return jsonResult(await core.getBoundIdentity()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('pine_get_source', 'Get current Pine Script source code from the editor', {}, async () => {
     try { return jsonResult(await core.getSource()); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
@@ -10,13 +15,22 @@ export function registerPineTools(server) {
 
   server.tool('pine_set_source', 'Set Pine Script source code in the editor', {
     source: z.string().describe('Pine Script source code to inject'),
-  }, async ({ source }) => {
-    try { return jsonResult(await core.setSource({ source })); }
+    expected_script_id: z.string().describe('Required persistent script ID; mutation stops if it is not the proven editor binding'),
+  }, async ({ source, expected_script_id }) => {
+    try {
+      const result = await core.setSource({ source, expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_compile', 'Compile / add the current Pine Script to the chart', {}, async () => {
-    try { return jsonResult(await core.compile()); }
+  server.tool('pine_compile', 'Compile / add the current Pine Script to the chart after a fail-closed identity check', {
+    expected_script_id: z.string().describe('Required persistent script ID; compile may persist and stops on mismatch'),
+  }, async ({ expected_script_id }) => {
+    try {
+      const result = await core.compile({ expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -25,8 +39,13 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_save', 'Save the current Pine Script (Ctrl+S)', {}, async () => {
-    try { return jsonResult(await core.save()); }
+  server.tool('pine_save', 'Save the current Pine Script only when its persistent identity matches the expected ID', {
+    expected_script_id: z.string().describe('Required persistent script ID; save stops on mismatch or protected ID'),
+  }, async ({ expected_script_id }) => {
+    try {
+      const result = await core.save({ expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
@@ -35,22 +54,36 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_smart_compile', 'Intelligent compile: detects button, compiles, checks errors, reports study changes', {}, async () => {
-    try { return jsonResult(await core.smartCompile()); }
+  server.tool('pine_smart_compile', 'Intelligent compile with a fail-closed persistent identity check', {
+    expected_script_id: z.string().describe('Required persistent script ID; compile stops on mismatch or protected ID'),
+  }, async ({ expected_script_id }) => {
+    try {
+      const result = await core.smartCompile({ expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_new', 'Create a new blank Pine Script', {
+  server.tool('pine_new', 'Request a new Pine Script and report success only after a new persistent identity is proven', {
     type: z.enum(['indicator', 'strategy', 'library']).describe('Type of script to create'),
-  }, async ({ type }) => {
-    try { return jsonResult(await core.newScript({ type })); }
+    expected_script_id: z.string().describe('Required persistent ID bound before requesting the new script'),
+  }, async ({ type, expected_script_id }) => {
+    try {
+      const result = await core.newScript({ type, expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_open', 'Open a saved Pine Script by name', {
-    name: z.string().describe('Name of the saved script to open (case-insensitive match)'),
-  }, async ({ name }) => {
-    try { return jsonResult(await core.openScript({ name })); }
+  server.tool('pine_open', 'Open a saved Pine Script and prove the editor is bound to its persistent ID', {
+    name: z.string().optional().describe('Unique name of the saved script to open (case-insensitive)'),
+    script_id: z.string().optional().describe('Persistent script ID to open; preferred over name'),
+    expected_script_id: z.string().describe('Required persistent ID bound before navigation'),
+  }, async ({ name, script_id, expected_script_id }) => {
+    try {
+      const result = await core.openScript({ name, script_id, expected_script_id });
+      return jsonResult(result, result.success === false);
+    }
     catch (err) { return jsonResult({ success: false, source: 'internal_api', error: err.message }, true); }
   });
 

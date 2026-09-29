@@ -47,7 +47,9 @@ Changing the chart:
 - indicator_set_inputs → change indicator settings (length, source, etc.)
 
 Pine Script development:
-- pine_set_source → inject code, pine_smart_compile → compile + check errors
+- pine_get_bound_identity → prove persistent script ID before any mutation; stop on UNPROVEN
+- pine_set_source / pine_smart_compile / pine_save → require the proven expected_script_id
+- pine_open / pine_new → success requires persistent binding proof; transient or mismatched state is failure
 - pine_get_errors → read errors, pine_get_console → read log output
 - WARNING: pine_get_source can return 200KB+ for complex scripts — avoid unless editing
 

@@ -42,14 +42,15 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `chart_set_visible_range` → zoom to exact date range (unix timestamps)
 
 ### "Work on Pine Script"
-1. `pine_set_source` → inject code into editor
-2. `pine_smart_compile` → compile with auto-detection + error check
-3. `pine_get_errors` → read compilation errors
-4. `pine_get_console` → read log.info() output
-5. `pine_get_source` → read current code back (WARNING: can be very large for complex scripts)
-6. `pine_save` → save to TradingView cloud
-7. `pine_new` → create blank indicator/strategy/library
-8. `pine_open` → load a saved script by name
+1. `pine_get_bound_identity` → prove the persistent script ID; stop if `UNPROVEN`
+2. `pine_set_source` with that `expected_script_id` → inject code into editor
+3. `pine_smart_compile` with the same `expected_script_id` → compile with auto-detection + error check
+4. `pine_get_errors` → read compilation errors
+5. `pine_get_console` → read log.info() output
+6. `pine_get_source` → read current code back (WARNING: can be very large for complex scripts)
+7. `pine_save` with the same `expected_script_id` → save to TradingView cloud
+8. `pine_new` → request a new script; treat `TRANSIENT_UNBOUND_BUFFER` as failure
+9. `pine_open` → load a saved script only when its postcondition proves the requested ID
 
 ### "Practice trading with replay"
 1. `replay_start` with `date: "2025-03-01"` → enter replay mode

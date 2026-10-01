@@ -8,6 +8,7 @@ import {
   addedPersistentScriptIds,
   configuredProtectedScriptIds,
   deriveBoundIdentity,
+  evaluateOpenNavigationGate,
   evaluatePreMutationGate,
   resolveRequestedScript,
 } from './pine_identity.js';
@@ -908,19 +909,56 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
   const resolved = resolveRequestedScript({ inventory, scriptId: script_id, name });
   if (!resolved.success) return { success: false, reason: resolved.reason, ...resolved };
 
+  const requestedId = resolved.resolved_script_id;
+  const requestedName = resolved.script.name || resolved.script.title;
   const current = await deps.getBoundIdentity({ _deps });
-  const gate = evaluatePreMutationGate({
+  const gate = evaluateOpenNavigationGate({
     identity: current,
-    expectedScriptId: expected_script_id,
+    targetScriptId: requestedId,
+    expectedTargetScriptId: expected_script_id,
+    inventory,
     protectedIds: deps.protectedIds,
   });
   if (!gate.ok) return gateFailure(current, gate);
 
-  const requestedId = resolved.resolved_script_id;
-  const requestedName = resolved.script.name || resolved.script.title;
+  const targetBefore = {
+    id: requestedId,
+    name: resolved.script.name || null,
+    title: resolved.script.title || null,
+    revision: resolved.script.revision ?? null,
+    modified: resolved.script.modified ?? null,
+  };
+  const targetSourceBefore = await deps.readSavedSource({
+    scriptId: requestedId,
+    revision: targetBefore.revision,
+    _deps,
+  });
+
+  const protectedBefore = inventory
+    .filter(script => {
+      const id = String(script?.id || '');
+      const suffix = id.split(';').at(-1);
+      return [...deps.protectedIds].some(value => {
+        const protectedId = String(value || '');
+        return protectedId === id || protectedId.split(';').at(-1) === suffix;
+      });
+    })
+    .map(script => ({
+      id: script.id,
+      name: script.name || null,
+      revision: script.revision ?? null,
+      modified: script.modified ?? null,
+    }));
+
   const navigated = await deps.openScriptViaUi({ name: requestedName, scriptId: requestedId, _deps });
   if (!navigated) {
-    return { success: false, reason: 'OPEN_UI_NAVIGATION_FAILED', requested_script_id: requestedId };
+    return {
+      success: false,
+      reason: 'OPEN_UI_NAVIGATION_FAILED',
+      requested_script_id: requestedId,
+      navigation_only: true,
+      downstream_write_authority: false,
+    };
   }
 
   let actual = null;
@@ -929,7 +967,60 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
     actual = await deps.getBoundIdentity({ _deps });
     if (actual.identity_confidence === 'PROVEN'
         && actual.bound_script_id === requestedId
-        && actual.unsaved_state === false) {
+        && actual.unsaved_state === false
+        && actual.buffer_state === 'LOADED_SAVED_REVISION') {
+      const inventoryAfter = await deps.listPersistentScripts({ _deps });
+      const targetMatches = inventoryAfter.filter(script => script?.id === requestedId);
+      if (targetMatches.length !== 1) {
+        return {
+          success: false,
+          reason: 'POSTCONDITION_FAILED',
+          postcondition: 'TARGET_PERSISTENCE',
+          requested_script_id: requestedId,
+          navigation_only: true,
+          downstream_write_authority: false,
+        };
+      }
+
+      const targetAfter = targetMatches[0];
+      const targetSourceAfter = await deps.readSavedSource({
+        scriptId: requestedId,
+        revision: targetAfter.revision,
+        _deps,
+      });
+      const targetUnchanged = (targetAfter.revision ?? null) === targetBefore.revision
+        && (targetAfter.modified ?? null) === targetBefore.modified
+        && targetSourceAfter === targetSourceBefore;
+
+      const protectedAfter = inventoryAfter
+        .filter(script => {
+          const id = String(script?.id || '');
+          const suffix = id.split(';').at(-1);
+          return [...deps.protectedIds].some(value => {
+            const protectedId = String(value || '');
+            return protectedId === id || protectedId.split(';').at(-1) === suffix;
+          });
+        })
+        .map(script => ({
+          id: script.id,
+          name: script.name || null,
+          revision: script.revision ?? null,
+          modified: script.modified ?? null,
+        }));
+
+      const protectedUnchanged = JSON.stringify(protectedAfter) === JSON.stringify(protectedBefore);
+      if (!targetUnchanged || !protectedUnchanged) {
+        return {
+          success: false,
+          reason: 'POSTCONDITION_FAILED',
+          requested_script_id: requestedId,
+          target_persistent_unchanged: targetUnchanged,
+          protected_objects_unchanged: protectedUnchanged,
+          navigation_only: true,
+          downstream_write_authority: false,
+        };
+      }
+
       return {
         success: true,
         opened: true,
@@ -937,7 +1028,14 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
         script_id: actual.bound_script_id,
         revision: actual.bound_revision,
         buffer_state: actual.buffer_state,
+        unsaved_state: actual.unsaved_state,
         identity_confidence: actual.identity_confidence,
+        navigation_path: gate.path,
+        navigation_only: true,
+        downstream_write_authority: false,
+        target_persistent_unchanged: true,
+        protected_objects_unchanged: true,
+        postcondition_proof: 'PASSED',
       };
     }
   }
@@ -950,6 +1048,8 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
     identity_confidence: actual?.identity_confidence || 'UNPROVEN',
     buffer_state: actual?.buffer_state || 'UNKNOWN',
     unsaved_state: actual?.unsaved_state ?? null,
+    navigation_only: true,
+    downstream_write_authority: false,
   };
 }
 

@@ -75,10 +75,10 @@ export function registerPineTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('pine_open', 'Open a saved Pine Script and prove the editor is bound to its persistent ID', {
+  server.tool('pine_open', 'Navigate to a saved Pine Script and prove the editor is bound to its persistent ID; a clean UNBOUND editor may cold-open an explicitly identified non-protected target. Navigation grants no write authority.', {
     name: z.string().optional().describe('Unique name of the saved script to open (case-insensitive)'),
-    script_id: z.string().optional().describe('Persistent script ID to open; preferred over name'),
-    expected_script_id: z.string().describe('Required persistent ID bound before navigation'),
+    script_id: z.string().optional().describe('Persistent target script ID to open; preferred over name'),
+    expected_script_id: z.string().describe('Required persistent target ID expected after navigation; must equal the resolved target ID'),
   }, async ({ name, script_id, expected_script_id }) => {
     try {
       const result = await core.openScript({ name, script_id, expected_script_id });

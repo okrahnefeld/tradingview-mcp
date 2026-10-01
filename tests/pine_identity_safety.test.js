@@ -4,6 +4,7 @@ import { compile, getBoundIdentity, newScript, openScript, save, setSource } fro
 import {
   DEFAULT_PROTECTED_SCRIPT_IDS,
   deriveBoundIdentity,
+  evaluateOpenNavigationGate,
   evaluateWriteIdentity,
 } from '../src/core/pine_identity.js';
 
@@ -98,7 +99,7 @@ describe('pine_open identity postcondition', () => {
     let identityReads = 0;
     const result = await openScript({
       name: 'Target',
-      expected_script_id: OLD_ID,
+      expected_script_id: TARGET_ID,
       _deps: safeDeps({
         listPersistentScripts: async () => [
           { id: OLD_ID, name: 'Previous', revision: 7 },
@@ -122,7 +123,7 @@ describe('pine_open identity postcondition', () => {
   it('never translates navigation-only completion into success', async () => {
     const result = await openScript({
       script_id: TARGET_ID,
-      expected_script_id: OLD_ID,
+      expected_script_id: TARGET_ID,
       _deps: safeDeps({
         listPersistentScripts: async () => [
           { id: OLD_ID, name: 'Previous', revision: 7 },
@@ -137,7 +138,103 @@ describe('pine_open identity postcondition', () => {
     });
 
     assert.equal(result.success, false);
-    assert.equal(result.reason, 'BINDING_NOT_PROVEN');
+    assert.equal(result.reason, 'NAVIGATION_STATE_UNSAFE');
+  });
+});
+
+describe('pine_open cold navigation gate', () => {
+  const inventory = [
+    { id: OLD_ID, name: 'Previous', revision: 7 },
+    { id: TARGET_ID, name: 'Target', revision: 2 },
+  ];
+
+  function unboundIdentity(overrides = {}) {
+    return {
+      success: true,
+      bound_script_id: null,
+      identity_confidence: 'UNPROVEN',
+      buffer_state: 'UNBOUND',
+      unsaved_state: null,
+      ...overrides,
+    };
+  }
+
+  it('allows navigation-only cold open from a clean UNBOUND editor to one persistent non-protected target', () => {
+    const gate = evaluateOpenNavigationGate({
+      identity: unboundIdentity(),
+      targetScriptId: TARGET_ID,
+      expectedTargetScriptId: TARGET_ID,
+      inventory,
+      protectedIds: new Set([PROTECTED_ID]),
+    });
+    assert.equal(gate.ok, true);
+    assert.equal(gate.path, 'COLD_NAVIGATION');
+    assert.equal(gate.navigation_only, true);
+    assert.equal(gate.downstream_write_authority, false);
+  });
+
+  it('rejects a cold-open expected target mismatch', () => {
+    const gate = evaluateOpenNavigationGate({
+      identity: unboundIdentity(),
+      targetScriptId: TARGET_ID,
+      expectedTargetScriptId: OLD_ID,
+      inventory,
+      protectedIds: new Set([PROTECTED_ID]),
+    });
+    assert.equal(gate.ok, false);
+    assert.equal(gate.reason, 'EXPECTED_TARGET_MISMATCH');
+  });
+
+  it('rejects a protected target from a clean UNBOUND editor', () => {
+    const gate = evaluateOpenNavigationGate({
+      identity: unboundIdentity(),
+      targetScriptId: PROTECTED_ID,
+      expectedTargetScriptId: PROTECTED_ID,
+      inventory: [...inventory, { id: PROTECTED_ID, name: 'Forward', revision: 4 }],
+      protectedIds: new Set([PROTECTED_ID]),
+    });
+    assert.equal(gate.ok, false);
+    assert.equal(gate.reason, 'PROTECTED_SCRIPT_ID');
+  });
+
+  it('rejects unknown or unsafe cold state', () => {
+    const gate = evaluateOpenNavigationGate({
+      identity: unboundIdentity({ buffer_state: 'UNKNOWN' }),
+      targetScriptId: TARGET_ID,
+      expectedTargetScriptId: TARGET_ID,
+      inventory,
+      protectedIds: new Set([PROTECTED_ID]),
+    });
+    assert.equal(gate.ok, false);
+    assert.equal(gate.reason, 'NAVIGATION_STATE_UNSAFE');
+  });
+
+  it('cold-opens successfully only after a clean persistent post-binding proof', async () => {
+    let reads = 0;
+    let inventoryReads = 0;
+    const persistent = [
+      { id: TARGET_ID, name: 'Target', title: 'Target', revision: 2, modified: 10 },
+    ];
+    const result = await openScript({
+      script_id: TARGET_ID,
+      expected_script_id: TARGET_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => { inventoryReads++; return persistent; },
+        readSavedSource: async () => '//@version=6\nindicator("Target")',
+        getBoundIdentity: async () => {
+          reads++;
+          return reads === 1 ? unboundIdentity() : provenIdentity(TARGET_ID, { bound_revision: 2 });
+        },
+        openScriptViaUi: async () => true,
+      }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.script_id, TARGET_ID);
+    assert.equal(result.navigation_path, 'COLD_NAVIGATION');
+    assert.equal(result.navigation_only, true);
+    assert.equal(result.downstream_write_authority, false);
+    assert.equal(result.postcondition_proof, 'PASSED');
+    assert.ok(inventoryReads >= 2);
   });
 });
 

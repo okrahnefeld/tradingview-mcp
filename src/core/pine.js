@@ -9,7 +9,6 @@ import {
   configuredProtectedScriptIds,
   deriveBoundIdentity,
   evaluatePreMutationGate,
-  evaluateWriteIdentity,
   resolveRequestedScript,
 } from './pine_identity.js';
 
@@ -857,7 +856,7 @@ export async function newScript({ type, expected_script_id, _deps = {} }) {
 
   const before = await deps.listPersistentScripts({ _deps });
   const previous = await deps.getBoundIdentity({ _deps });
-  const gate = evaluateWriteIdentity({
+  const gate = evaluatePreMutationGate({
     identity: previous,
     expectedScriptId: expected_script_id,
     protectedIds: deps.protectedIds,
@@ -910,7 +909,7 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
   if (!resolved.success) return { success: false, reason: resolved.reason, ...resolved };
 
   const current = await deps.getBoundIdentity({ _deps });
-  const gate = evaluateWriteIdentity({
+  const gate = evaluatePreMutationGate({
     identity: current,
     expectedScriptId: expected_script_id,
     protectedIds: deps.protectedIds,

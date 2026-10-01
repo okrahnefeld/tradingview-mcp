@@ -6,6 +6,7 @@ import {
   evaluateStaleProtectedBuffer,
   evaluateWriteIdentity,
 } from '../src/core/pine_identity.js';
+import { newScript, openScript } from '../src/core/pine.js';
 
 const PROTECTED_ID = DEFAULT_PROTECTED_SCRIPT_IDS[0];
 const OTHER_ID = 'USER;33333333333333333333333333333333';
@@ -103,5 +104,60 @@ describe('evaluatePreMutationGate (stale-buffer guard composed with the existing
     });
     assert.equal(gate.ok, false);
     assert.equal(gate.reason, 'PROTECTED_SCRIPT_ID');
+  });
+});
+
+describe('stale-buffer guard reaches openScript and newScript (completes WORKSTREAM D coverage)', () => {
+  function safeDeps(overrides = {}) {
+    return {
+      ensurePineEditorOpen: async () => true,
+      sleep: async () => {},
+      protectedIds: new Set([PROTECTED_ID]),
+      postconditionAttempts: 1,
+      ...overrides,
+    };
+  }
+
+  it('openScript stops with STOP_PROTECTED_STALE_BUFFER when the current buffer is a dirty protected one, even for a non-protected target', async () => {
+    let navigated = false;
+    const result = await openScript({
+      name: 'Target',
+      script_id: OTHER_ID,
+      expected_script_id: OTHER_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: OTHER_ID, name: 'Target', revision: 1 }],
+        getBoundIdentity: async () => provenIdentity(PROTECTED_ID, {
+          buffer_state: 'MODIFIED_UNSAVED',
+          unsaved_state: true,
+        }),
+        openScriptViaUi: async () => { navigated = true; return true; },
+      }),
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.reason, 'STOP_PROTECTED_STALE_BUFFER');
+    assert.equal(result.no_mutation, true);
+    assert.equal(navigated, false, 'must never attempt navigation while the hazard is present');
+  });
+
+  it('newScript stops with STOP_PROTECTED_STALE_BUFFER before any UI create action', async () => {
+    let createAttempted = false;
+    const result = await newScript({
+      type: 'indicator',
+      expected_script_id: OTHER_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: OTHER_ID, name: 'Other', revision: 1 }],
+        getBoundIdentity: async () => provenIdentity(PROTECTED_ID, {
+          buffer_state: 'MODIFIED_UNSAVED',
+          unsaved_state: true,
+        }),
+        createNewViaUi: async () => { createAttempted = true; return true; },
+      }),
+    });
+
+    assert.equal(result.success, false);
+    assert.equal(result.reason, 'STOP_PROTECTED_STALE_BUFFER');
+    assert.equal(result.no_mutation, true);
+    assert.equal(createAttempted, false, 'must never attempt script creation while the hazard is present');
   });
 });

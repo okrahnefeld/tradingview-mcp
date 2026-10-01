@@ -220,6 +220,174 @@ export function evaluatePreMutationGate({
   return evaluateWriteIdentity({ identity, expectedScriptId, protectedIds });
 }
 
+
+function isProtectedScriptId(value, protectedIds) {
+  const normalized = normalizeScriptId(value);
+  if (!normalized) return false;
+  const suffix = normalized.split(';').at(-1);
+  const protectedSet = protectedIds instanceof Set ? protectedIds : new Set(protectedIds || []);
+  return [...protectedSet].some(entry => {
+    const protectedId = normalizeScriptId(entry);
+    const protectedSuffix = protectedId.split(';').at(-1);
+    return protectedId === normalized || (protectedSuffix && protectedSuffix === suffix);
+  });
+}
+
+function persistentInventoryMatchCount(scriptId, inventory = []) {
+  const normalized = normalizeScriptId(scriptId);
+  if (!normalized) return 0;
+  const suffix = normalized.split(';').at(-1);
+  return inventory.filter(script => {
+    const entryId = inventoryId(script);
+    if (!entryId) return false;
+    return entryId === normalized || entryId.split(';').at(-1) === suffix;
+  }).length;
+}
+
+/**
+ * Navigation-only gate for pine_open.
+ *
+ * Navigation authority is deliberately distinct from write authority:
+ * - an already-proven, non-protected current binding may navigate;
+ * - a clean UNBOUND editor may cold-navigate to one explicitly named,
+ *   uniquely persistent, non-protected target;
+ * - no path through this helper grants write authority.
+ *
+ * All save-capable operations continue to use evaluatePreMutationGate().
+ */
+export function evaluateOpenNavigationGate({
+  identity,
+  targetScriptId,
+  expectedTargetScriptId,
+  inventory = [],
+  protectedIds = configuredProtectedScriptIds(),
+} = {}) {
+  const target = normalizeScriptId(targetScriptId);
+  const expectedTarget = normalizeScriptId(expectedTargetScriptId);
+
+  if (!target) {
+    return { ok: false, success: false, reason: 'TARGET_SCRIPT_ID_REQUIRED', no_mutation: true };
+  }
+  if (!expectedTarget) {
+    return { ok: false, success: false, reason: 'EXPECTED_TARGET_SCRIPT_ID_REQUIRED', no_mutation: true };
+  }
+  if (target !== expectedTarget) {
+    return {
+      ok: false,
+      success: false,
+      reason: 'EXPECTED_TARGET_MISMATCH',
+      no_mutation: true,
+      target_script_id: target,
+      expected_target_script_id: expectedTarget,
+    };
+  }
+
+  const staleGuard = evaluateStaleProtectedBuffer({ identity, protectedIds });
+  if (staleGuard.stale) {
+    return {
+      ok: false,
+      success: false,
+      reason: staleGuard.reason,
+      no_mutation: true,
+      downstream_write_authority: false,
+      protected_script_id: staleGuard.protected_script_id,
+      buffer_state: staleGuard.buffer_state,
+    };
+  }
+
+  if (isProtectedScriptId(target, protectedIds)) {
+    return {
+      ok: false,
+      success: false,
+      reason: 'PROTECTED_SCRIPT_ID',
+      no_mutation: true,
+      target_script_id: target,
+    };
+  }
+
+  const targetMatchCount = persistentInventoryMatchCount(target, inventory);
+  if (targetMatchCount === 0) {
+    return {
+      ok: false,
+      success: false,
+      reason: 'TARGET_NOT_FOUND',
+      no_mutation: true,
+      target_script_id: target,
+    };
+  }
+  if (targetMatchCount > 1) {
+    return {
+      ok: false,
+      success: false,
+      reason: 'TARGET_AMBIGUOUS',
+      no_mutation: true,
+      target_script_id: target,
+      match_count: targetMatchCount,
+    };
+  }
+
+  const actual = normalizeScriptId(identity?.bound_script_id);
+  const currentProven = identity?.identity_confidence === IDENTITY_CONFIDENCE.PROVEN && !!actual;
+
+  if (currentProven) {
+    if (isProtectedScriptId(actual, protectedIds)) {
+      return {
+        ok: false,
+        success: false,
+        reason: 'PROTECTED_SCRIPT_ID',
+        no_mutation: true,
+        actual_bound_script_id: actual,
+      };
+    }
+    if (identity?.unsaved_state === true || identity?.buffer_state === 'MODIFIED_UNSAVED') {
+      return {
+        ok: false,
+        success: false,
+        reason: 'NAVIGATION_STATE_UNSAFE',
+        no_mutation: true,
+        actual_bound_script_id: actual,
+        buffer_state: identity?.buffer_state || 'UNKNOWN',
+        unsaved_state: identity?.unsaved_state ?? null,
+      };
+    }
+    return {
+      ok: true,
+      success: true,
+      path: 'EXISTING_PROVEN_BINDING',
+      navigation_only: true,
+      downstream_write_authority: false,
+      target_script_id: target,
+      actual_bound_script_id: actual,
+    };
+  }
+
+  const coldEligible = identity?.identity_confidence === IDENTITY_CONFIDENCE.UNPROVEN
+    && !actual
+    && identity?.buffer_state === 'UNBOUND'
+    && identity?.unsaved_state !== true;
+
+  if (coldEligible) {
+    return {
+      ok: true,
+      success: true,
+      path: 'COLD_NAVIGATION',
+      navigation_only: true,
+      downstream_write_authority: false,
+      target_script_id: target,
+    };
+  }
+
+  return {
+    ok: false,
+    success: false,
+    reason: 'NAVIGATION_STATE_UNSAFE',
+    no_mutation: true,
+    identity_confidence: identity?.identity_confidence || 'UNPROVEN',
+    buffer_state: identity?.buffer_state || 'UNKNOWN',
+    unsaved_state: identity?.unsaved_state ?? null,
+  };
+}
+
 export function resolveRequestedScript({ inventory = [], scriptId, name } = {}) {
   const requestedId = normalizeScriptId(scriptId);
   if (requestedId) {

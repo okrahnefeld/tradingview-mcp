@@ -31,6 +31,7 @@ function safeDeps(overrides = {}) {
     sleep: async () => {},
     protectedIds: new Set(),
     postconditionAttempts: 1,
+    readSavedSource: async () => 'saved source',
     ...overrides,
   };
 }

@@ -219,6 +219,27 @@ describe('pre-write identity interlock', () => {
     });
 
     assert.equal(result.success, false);
+    // The stale-protected-buffer guard (WORKSTREAM D) now fires first for this
+    // exact pattern (protected ID + unsaved buffer) — a more specific, earlier
+    // diagnosis than the generic PROTECTED_SCRIPT_ID gate it used to hit.
+    assert.equal(result.reason, 'STOP_PROTECTED_STALE_BUFFER');
+    assert.equal(result.no_mutation, true);
+    assert.equal(evaluateCalls, 0);
+  });
+
+  it('still blocks protected-ID writes when the buffer is not flagged unsaved', async () => {
+    let evaluateCalls = 0;
+    const result = await setSource({
+      source: '//@version=6\nindicator("blocked")',
+      expected_script_id: PROTECTED_ID,
+      _deps: safeDeps({
+        protectedIds: new Set([PROTECTED_ID]),
+        getBoundIdentity: async () => provenIdentity(PROTECTED_ID),
+        evaluate: async () => { evaluateCalls++; return true; },
+      }),
+    });
+
+    assert.equal(result.success, false);
     assert.equal(result.reason, 'PROTECTED_SCRIPT_ID');
     assert.equal(evaluateCalls, 0);
   });

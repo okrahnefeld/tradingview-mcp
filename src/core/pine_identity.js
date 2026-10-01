@@ -160,6 +160,66 @@ export function evaluateWriteIdentity({
   };
 }
 
+/**
+ * Detects the field-observed TradingView Desktop hazard: the Pine Editor's own
+ * tab-restoration can surface a protected script's identity with foreign,
+ * unsaved content whenever the editor panel is (re)opened — independent of any
+ * MCP tool call. This must be checked before ANY save-capable mutation, not
+ * only when the protected ID is the explicit expected_script_id target.
+ */
+export function evaluateStaleProtectedBuffer({
+  identity,
+  protectedIds = configuredProtectedScriptIds(),
+} = {}) {
+  const protectedSet = protectedIds instanceof Set ? protectedIds : new Set(protectedIds || []);
+  const actual = normalizeScriptId(identity?.bound_script_id);
+  if (!actual) return { stale: false };
+
+  const actualSuffix = actual.split(';').at(-1);
+  const isProtected = [...protectedSet].some(value => {
+    const protectedId = normalizeScriptId(value);
+    const protectedSuffix = protectedId.split(';').at(-1);
+    return protectedId === actual || (protectedSuffix && protectedSuffix === actualSuffix);
+  });
+  if (!isProtected) return { stale: false };
+
+  const unsavedHazard = identity?.unsaved_state === true || identity?.buffer_state === 'MODIFIED_UNSAVED';
+  if (!unsavedHazard) return { stale: false };
+
+  return {
+    stale: true,
+    reason: 'STOP_PROTECTED_STALE_BUFFER',
+    protected_script_id: actual,
+    buffer_state: identity?.buffer_state || 'UNKNOWN',
+  };
+}
+
+/**
+ * Single pre-mutation gate composing the stale-protected-buffer hazard check
+ * with the existing expected-identity gate. Every save-capable mutation path
+ * must route through this, not evaluateWriteIdentity alone, so the hazard
+ * check cannot be silently skipped by a new call site.
+ */
+export function evaluatePreMutationGate({
+  identity,
+  expectedScriptId,
+  protectedIds = configuredProtectedScriptIds(),
+} = {}) {
+  const staleGuard = evaluateStaleProtectedBuffer({ identity, protectedIds });
+  if (staleGuard.stale) {
+    return {
+      ok: false,
+      success: false,
+      reason: staleGuard.reason,
+      no_mutation: true,
+      downstream_write_authority: false,
+      protected_script_id: staleGuard.protected_script_id,
+      buffer_state: staleGuard.buffer_state,
+    };
+  }
+  return evaluateWriteIdentity({ identity, expectedScriptId, protectedIds });
+}
+
 export function resolveRequestedScript({ inventory = [], scriptId, name } = {}) {
   const requestedId = normalizeScriptId(scriptId);
   if (requestedId) {

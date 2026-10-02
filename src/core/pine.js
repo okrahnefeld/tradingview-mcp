@@ -164,9 +164,13 @@ async function readEditorBindingState({ _deps = {} } = {}) {
         }
       }
 
+      var dialogRoot = container.closest('[role="dialog"]')
+        || container.closest('[data-name*="dialog"]')
+        || container.closest('[class*="dialog"]');
       var titleNode = document.querySelector('[data-name="script-title"]')
         || document.querySelector('[data-name="pine-script-name"]')
-        || document.querySelector('[class*="scriptTitle"]');
+        || document.querySelector('[class*="scriptTitle"]')
+        || (dialogRoot && dialogRoot.querySelector('h2.apply-common-tooltip[class*="label-"]'));
       if (titleNode) visibleTitle = titleNode.textContent.trim() || null;
       var unsavedNode = document.querySelector('[data-name*="unsaved"], [aria-label*="unsaved" i], [title*="unsaved" i]');
       if (unsavedNode) dirtyHint = true;
@@ -245,7 +249,7 @@ async function readSavedSource({ scriptId, revision, _deps = {} }) {
   return typeof result?.source === 'string' ? result.source : undefined;
 }
 
-export async function getBoundIdentity({ _deps = {} } = {}) {
+export async function getBoundIdentity({ expected_script_id, _deps = {} } = {}) {
   const deps = dependencies(_deps);
   const ready = await deps.ensurePineEditorOpen();
   if (!ready) {
@@ -262,22 +266,67 @@ export async function getBoundIdentity({ _deps = {} } = {}) {
       error: error.message,
     };
   }
+
   const editorState = await deps.readEditorBindingState({ _deps });
   const preliminary = deriveBoundIdentity({ editorState, inventory });
-  let savedSource;
+
   if (preliminary.bound_script_id) {
-    savedSource = await deps.readSavedSource({
+    const savedSource = await deps.readSavedSource({
       scriptId: preliminary.bound_script_id,
       revision: preliminary.bound_revision,
       _deps,
     });
+    return deriveBoundIdentity({ editorState, inventory, savedSource });
   }
-  return deriveBoundIdentity({ editorState, inventory, savedSource });
+
+  // TradingView Desktop currently uses an opaque dialog-local Monaco URI
+  // (file:///<uuid>.pine?placement=dialog) that carries no persistent USER ID.
+  // Never trust the visible title alone. An explicit expected target may be
+  // proven only by the conjunction of:
+  //   1) one exact persistent inventory object for expected_script_id,
+  //   2) exact visible-title match to that object's persistent name,
+  //   3) byte-equivalent clean editor source and persisted source.
+  // This expected-target proof is intentionally unavailable when no expected
+  // persistent ID is supplied by the caller.
+  const expected = typeof expected_script_id === 'string' ? expected_script_id.trim() : '';
+  if (expected && editorState?.editor_visible && editorState?.dirty_hint !== true) {
+    const expectedMatches = inventory.filter(script => String(script?.id || '').trim() === expected);
+    if (expectedMatches.length === 1) {
+      const entry = expectedMatches[0];
+      const persistentName = String(entry?.name || entry?.title || '').trim();
+      const visibleTitle = String(editorState?.visible_title || '').trim();
+      if (persistentName && visibleTitle === persistentName) {
+        const savedSource = await deps.readSavedSource({
+          scriptId: expected,
+          revision: entry.revision,
+          _deps,
+        });
+        const normalizeSource = value => typeof value === 'string' ? value.replace(/\r\n/g, '\n') : null;
+        const editorSource = normalizeSource(editorState?.source);
+        const persistentSource = normalizeSource(savedSource);
+        if (editorSource !== null && persistentSource !== null && editorSource === persistentSource) {
+          const provenState = {
+            ...editorState,
+            binding_candidates: [
+              ...(Array.isArray(editorState.binding_candidates) ? editorState.binding_candidates : []),
+              { id: expected, source: 'expected_target_title_source_match' },
+            ],
+          };
+          return {
+            ...deriveBoundIdentity({ editorState: provenState, inventory, savedSource }),
+            identity_proof: 'EXPECTED_TARGET_TITLE_SOURCE_MATCH',
+          };
+        }
+      }
+    }
+  }
+
+  return preliminary;
 }
 
 async function preWriteIdentity(expectedScriptId, _deps = {}) {
   const deps = dependencies(_deps);
-  const identity = await deps.getBoundIdentity({ _deps });
+  const identity = await deps.getBoundIdentity({ expected_script_id: expectedScriptId, _deps });
   const gate = evaluatePreMutationGate({
     identity,
     expectedScriptId,
@@ -964,7 +1013,7 @@ export async function openScript({ name, script_id, expected_script_id, _deps = 
   let actual = null;
   for (let attempt = 0; attempt < deps.postconditionAttempts; attempt++) {
     await deps.sleep(attempt === 0 ? 250 : 200);
-    actual = await deps.getBoundIdentity({ _deps });
+    actual = await deps.getBoundIdentity({ expected_script_id: requestedId, _deps });
     if (actual.identity_confidence === 'PROVEN'
         && actual.bound_script_id === requestedId
         && actual.unsaved_state === false

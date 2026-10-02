@@ -3,8 +3,10 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/pine.js';
 
 export function registerPineTools(server) {
-  server.tool('pine_get_bound_identity', 'Read the Pine editor binding from persistent platform identity signals. Returns UNPROVEN when identity cannot be established; visible title alone is never accepted.', {}, async () => {
-    try { return jsonResult(await core.getBoundIdentity()); }
+  server.tool('pine_get_bound_identity', 'Read the Pine editor binding from persistent platform identity signals. Visible title alone is never accepted. When expected_script_id is supplied, an opaque dialog-local editor may be proven only by exact persistent target ID + exact persistent name + byte-identical clean persisted source.', {
+    expected_script_id: z.string().optional().describe('Optional explicit persistent target ID used only for the strict expected-target title+source proof path'),
+  }, async ({ expected_script_id }) => {
+    try { return jsonResult(await core.getBoundIdentity({ expected_script_id })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

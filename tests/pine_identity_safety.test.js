@@ -93,6 +93,92 @@ describe('canonical Pine identity', () => {
     assert.equal(identity.identity_confidence, 'UNPROVEN');
     assert.equal(identity.identity_reason, 'NO_EDITOR_BINDING_SIGNAL');
   });
+
+  it('proves an opaque dialog binding only for an explicit target with exact persistent name and byte-identical source', async () => {
+    const identity = await getBoundIdentity({
+      expected_script_id: TARGET_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: TARGET_ID, name: 'Target', revision: 2 }],
+        readEditorBindingState: async () => ({
+          editor_visible: true,
+          visible_title: 'Target',
+          source: '//@version=6\nindicator("Target")',
+          model_uri: 'file:///2f56fb8f-4a3b-474a-a949-b59411f95be5.pine?placement=dialog',
+          dirty_hint: false,
+          binding_candidates: [],
+        }),
+        readSavedSource: async ({ scriptId, revision }) => {
+          assert.equal(scriptId, TARGET_ID);
+          assert.equal(revision, 2);
+          return '//@version=6\nindicator("Target")';
+        },
+      }),
+    });
+
+    assert.equal(identity.bound_script_id, TARGET_ID);
+    assert.equal(identity.identity_confidence, 'PROVEN');
+    assert.equal(identity.unsaved_state, false);
+    assert.equal(identity.identity_proof, 'EXPECTED_TARGET_TITLE_SOURCE_MATCH');
+  });
+
+  it('does not prove an explicit target when only the visible title matches but source differs', async () => {
+    const identity = await getBoundIdentity({
+      expected_script_id: TARGET_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: TARGET_ID, name: 'Target', revision: 2 }],
+        readEditorBindingState: async () => ({
+          editor_visible: true,
+          visible_title: 'Target',
+          source: 'different source',
+          dirty_hint: false,
+          binding_candidates: [],
+        }),
+        readSavedSource: async () => 'persisted source',
+      }),
+    });
+
+    assert.equal(identity.bound_script_id, null);
+    assert.equal(identity.identity_confidence, 'UNPROVEN');
+  });
+
+  it('does not prove an explicit target when source matches but visible title names a different object', async () => {
+    const identity = await getBoundIdentity({
+      expected_script_id: TARGET_ID,
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: TARGET_ID, name: 'Target', revision: 2 }],
+        readEditorBindingState: async () => ({
+          editor_visible: true,
+          visible_title: 'Other',
+          source: 'same source',
+          dirty_hint: false,
+          binding_candidates: [],
+        }),
+        readSavedSource: async () => 'same source',
+      }),
+    });
+
+    assert.equal(identity.bound_script_id, null);
+    assert.equal(identity.identity_confidence, 'UNPROVEN');
+  });
+
+  it('does not activate the composite proof path without an explicit expected persistent ID', async () => {
+    const identity = await getBoundIdentity({
+      _deps: safeDeps({
+        listPersistentScripts: async () => [{ id: TARGET_ID, name: 'Target', revision: 2 }],
+        readEditorBindingState: async () => ({
+          editor_visible: true,
+          visible_title: 'Target',
+          source: 'same source',
+          dirty_hint: false,
+          binding_candidates: [],
+        }),
+        readSavedSource: async () => 'same source',
+      }),
+    });
+
+    assert.equal(identity.bound_script_id, null);
+    assert.equal(identity.identity_confidence, 'UNPROVEN');
+  });
 });
 
 describe('pine_open identity postcondition', () => {

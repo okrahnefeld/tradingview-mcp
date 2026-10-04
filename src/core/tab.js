@@ -10,7 +10,15 @@
  * (Approach from issue #155 and PR #163, verified on Desktop 3.1.0.)
  */
 import CDP from 'chrome-remote-interface';
-import { getClient, reconnectTo, CDP_HOST, CDP_PORT } from '../connection.js';
+import { getClient, getTargetInfo, reconnectTo, CDP_HOST, CDP_PORT } from '../connection.js';
+import {
+  classifyTarget,
+  selectNewTarget,
+  describeSelectionFailure,
+  protectedIdsFromEnv,
+  toProtectedIdSet,
+  LANDING_DOM_PROBE,
+} from './target_identity.js';
 
 /**
  * List all open chart tabs (CDP page targets).
@@ -22,14 +30,17 @@ export async function list() {
   // Chart tabs plus new-tab landing pages (layout picker), so every tab in the
   // top bar is listable and switchable.
   const tabs = targets
-    .filter(t => t.type === 'page' && (/tradingview\.com\/chart/i.test(t.url) || t.title === 'New tab'))
+    .filter(t => {
+      const kind = classifyTarget(t);
+      return kind === 'chart' || kind === 'landing';
+    })
     .map((t, i) => ({
       index: i,
       id: t.id,
       title: t.title.replace(/^Live stock.*charts on /, ''),
       url: t.url,
       chart_id: t.url.match(/\/chart\/([^/?]+)/)?.[1] || null,
-      is_chart: /tradingview\.com\/chart/i.test(t.url),
+      is_chart: classifyTarget(t) === 'chart',
     }));
 
   return { success: true, tab_count: tabs.length, tabs };
@@ -83,11 +94,48 @@ async function isTargetVisible(targetId) {
   }
 }
 
-/** Find an open new-tab landing page target (shows the layout picker). */
-async function findLandingTarget() {
+/** Fetch the full CDP target list. */
+async function listTargets() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const targets = await resp.json();
-  return targets.find(t => t.type === 'page' && t.title === 'New tab') || null;
+  return resp.json();
+}
+
+/**
+ * The targets we must never hand back as "newly created": anything the operator
+ * fenced off via TV_PROTECTED_TARGET_IDS, plus whatever this client is currently
+ * attached to. The second half matters because the chart we already hold is, by
+ * definition, not the one a create action just produced.
+ */
+async function protectedTargetIds() {
+  const ids = protectedIdsFromEnv();
+  try {
+    const current = await getTargetInfo();
+    if (current?.id) ids.add(current.id);
+  } catch {
+    // Not attached yet; the env deny-list still applies.
+  }
+  return ids;
+}
+
+/**
+ * Find an open new-tab landing page target (the layout picker).
+ *
+ * Identified structurally, so it works on localized builds where the tab title is
+ * not the English 'New tab'. Protected targets are never returned.
+ */
+async function findLandingTarget(protectedIds = null) {
+  const targets = await listTargets();
+  const deny = protectedIds ? toProtectedIdSet(protectedIds) : await protectedTargetIds();
+  return targets.find(t => classifyTarget(t) === 'landing' && !deny.has(t.id)) || null;
+}
+
+/** Read-only probe: does this target's DOM actually show the layout picker? */
+async function hasLandingDom(targetId) {
+  try {
+    return await withTarget(targetId, async (evalIn) => !!(await evalIn(LANDING_DOM_PROBE)));
+  } catch {
+    return false;
+  }
 }
 
 /** Run fn with an eval helper attached to a specific target. */
@@ -112,10 +160,15 @@ async function withTarget(targetId, fn) {
  * Reuses an already-open landing tab instead of opening another one.
  */
 export async function newTab({ layout, name } = {}) {
-  let landing = await findLandingTarget();
+  const deny = await protectedTargetIds();
+  let landing = await findLandingTarget(deny);
   let shellCounts = null;
 
   if (!landing) {
+    // Snapshot the full target set BEFORE the side effect, so the object the click
+    // creates can be identified by set difference rather than by its title.
+    const targetsBefore = await listTargets();
+
     shellCounts = await withShell(async (evalIn) => {
       const before = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
       const clicked = await evalIn(`
@@ -131,7 +184,29 @@ export async function newTab({ layout, name } = {}) {
       const after = await evalIn(`document.querySelectorAll('.tabs-container .tab').length`);
       return { before, after };
     });
-    landing = await findLandingTarget();
+
+    // Poll for the new landing target, then require that exactly one appeared and
+    // that its DOM really is the layout picker. Zero or several -> fail closed.
+    let selection = null;
+    for (let i = 0; i < 20; i++) {
+      const targetsAfter = await listTargets();
+      selection = selectNewTarget({
+        before: targetsBefore,
+        after: targetsAfter,
+        kind: 'landing',
+        protectedIds: deny,
+      });
+      if (selection.ok && await hasLandingDom(selection.target.id)) break;
+      if (selection.ok) selection = { ok: false, reason: 'LANDING_DOM_NOT_CONFIRMED', candidateIds: [selection.target.id] };
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (!selection || !selection.ok) {
+      throw new Error(
+        `${describeSelectionFailure('landing', selection || { reason: 'NO_NEW_TARGET' })} `
+        + 'The shell may have opened a tab that could not be bound; no further action was taken.'
+      );
+    }
+    landing = selection.target;
   }
 
   if (!layout) {
@@ -146,13 +221,12 @@ export async function newTab({ layout, name } = {}) {
 
   if (!landing) throw new Error('New tab opened but its landing page target was not found.');
 
-  // Snapshot existing chart targets so we can spot the one the pick creates.
-  const beforeResp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-  const chartIdsBefore = new Set(
-    (await beforeResp.json())
-      .filter(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
-      .map(t => t.id)
-  );
+  // Snapshot every target so the chart the pick creates can be identified by set
+  // difference. The landing -> chart navigation swaps renderer processes, so the
+  // new chart usually arrives under a NEW target id; on some builds the landing
+  // target navigates in place and keeps its id, which is why it is allow-listed
+  // below rather than treated as pre-existing.
+  const targetsBeforePick = await listTargets();
 
   const wantNew = String(layout).trim().toLowerCase() === 'new';
   const layoutName = name || 'New layout';
@@ -223,17 +297,33 @@ export async function newTab({ layout, name } = {}) {
   // The chart loads under a NEW CDP target: the file:// landing -> https://
   // chart navigation swaps renderer processes, so the target id changes.
   // Wait for a chart target that wasn't there before the pick.
-  let chartTarget = null;
+  let selection = null;
   for (let i = 0; i < 30; i++) {
     await new Promise(r => setTimeout(r, 500));
-    const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
-    const targets = await resp.json();
-    chartTarget = targets.find(x =>
-      x.type === 'page' && /tradingview\.com\/chart/i.test(x.url) && !chartIdsBefore.has(x.id)
-    ) || targets.find(x => x.id === landing.id && /tradingview\.com\/chart/i.test(x.url)) || null;
-    if (chartTarget) break;
+    selection = selectNewTarget({
+      before: targetsBeforePick,
+      after: await listTargets(),
+      kind: 'chart',
+      protectedIds: deny,
+      // Our own landing target is allowed to BE the new chart: navigating in place
+      // keeps the id. Ownership is already proven -- we created and bound it.
+      alsoAllowIds: [landing.id],
+    });
+    if (selection.ok) break;
   }
-  if (!chartTarget) throw new Error(`Picked "${picked}" but no new chart target appeared.`);
+  if (!selection || !selection.ok) {
+    throw new Error(
+      `Picked "${picked}" but the resulting chart target could not be proven. `
+      + describeSelectionFailure('chart', selection || { reason: 'NO_NEW_TARGET' })
+    );
+  }
+  const chartTarget = selection.target;
+
+  // Belt and braces: never rebind onto a protected surface, whatever the selector
+  // concluded. If this ever fires, the selector has a hole and we stop instead.
+  if (deny.has(chartTarget.id)) {
+    throw new Error(`Refusing to bind protected target ${chartTarget.id}.`);
+  }
 
   // Give the chart a moment to boot, then follow it.
   await new Promise(r => setTimeout(r, 2000));

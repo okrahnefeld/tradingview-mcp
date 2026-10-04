@@ -232,19 +232,44 @@ export async function newTab({ layout, name } = {}) {
   const layoutName = name || 'New layout';
   const picked = await withTarget(landing.id, async (evalIn) => {
     if (wantNew) {
-      // "Create new layout" opens a naming dialog; the Create button stays
-      // disabled until the name input is filled (React controlled input, so
-      // the native value setter + input event are required).
-      await evalIn(`(function(){ var b = document.querySelector('.create-new-layout-button'); if (b) b.click(); })()`);
-      await new Promise(r => setTimeout(r, 700));
+      // "Create new layout" opens a naming form; the Create button stays disabled
+      // until the name field is filled (React controlled input, so the native value
+      // setter plus an input event are required).
+      //
+      // Nothing here may key off visible text. The form is a `.modal-window` titled
+      // in the user's language ("Neues Layout erstellen" on a German build), its name
+      // field is placeholder-localized ("Mein Layout"), and its buttons read
+      // "Erstellen"/"Abbrechen". The stable signals are structural: the name input is
+      // the `maxlength="64"` text input inside the modal, distinguishable from the
+      // page's Search box by the absence of the search box's start-slot modifier; and
+      // the confirm button is the one whose class carries the `primary-` modifier,
+      // with Cancel carrying `secondary-`.
+      const FORM = `(document.querySelector('.modal-window')
+                     || document.querySelector('[class*="dialog"], [role="dialog"]'))`;
+      const NAME_INPUT = `(function(){
+        var f = ${FORM};
+        if (!f) return null;
+        var ins = Array.prototype.slice.call(f.querySelectorAll('input[type="text"]'));
+        // Exclude the Search box, which carries a start-slot modifier class.
+        var cand = ins.filter(function(i){ return !/with-start-slot/.test(String(i.className)); });
+        return cand[0] || ins[0] || null;
+      })()`;
+
+      // The create control TOGGLES the form. Opening an already-open form closes it,
+      // which is how this path previously destroyed its own precondition, so only
+      // click when the form is not already showing its name field.
+      const alreadyOpen = await evalIn(`!!${NAME_INPUT}`);
+      if (!alreadyOpen) {
+        await evalIn(`(function(){ var b = document.querySelector('.create-new-layout-button'); if (b) b.click(); })()`);
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 300));
+          if (await evalIn(`!!${NAME_INPUT}`)) break;
+        }
+      }
+
       const filled = await evalIn(`
         (function() {
-          // The dialog's name field (not the landing page's Search box).
-          var inp = document.querySelector('input[placeholder="My layout"]');
-          if (!inp) {
-            var dlg = document.querySelector('[class*="dialog"], [role="dialog"]');
-            if (dlg) inp = dlg.querySelector('input');
-          }
+          var inp = ${NAME_INPUT};
           if (!inp) return 'no-dialog-input';
           var setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
           setter.call(inp, ${JSON.stringify(name || 'New layout')});
@@ -252,20 +277,38 @@ export async function newTab({ layout, name } = {}) {
           return 'filled';
         })()
       `);
-      if (filled !== 'filled') throw new Error(`Create-layout dialog did not open as expected (${filled}).`);
+      if (filled !== 'filled') throw new Error(`Create-layout form did not open as expected (${filled}).`);
       await new Promise(r => setTimeout(r, 400));
+      // The confirm button is identified by its `primary-` class token rather than by
+      // a regex or its label. Two reasons. Its label is localized ("Erstellen"), and
+      // anything injected through a template literal has its backslash escapes
+      // consumed before the browser sees it: a `\s` in the payload arrives as a bare
+      // `s`, which silently stops matching, and a `\n` would drop a raw newline into
+      // a regex literal, which does not parse at all. classList needs no escaping.
       const created = await evalIn(`
         (function() {
-          var scope = document.querySelector('[class*="dialog"], [role="dialog"]') || document;
-          var btns = scope.querySelectorAll('button');
+          var scope = ${FORM} || document;
+          var btns = Array.prototype.slice.call(scope.querySelectorAll('button'));
+          var primary = btns.filter(function(b){
+            var cl = b.classList;
+            for (var k = 0; k < cl.length; k++) {
+              if (cl[k].lastIndexOf('primary-', 0) === 0) return !b.disabled;
+            }
+            return false;
+          });
+          if (primary.length === 1) { primary[0].click(); return 'primary'; }
+          // Fallback for builds that label it in English.
           for (var i = 0; i < btns.length; i++) {
-            var t = (btns[i].textContent || '').trim().toLowerCase();
-            if (t === 'create' && !btns[i].disabled) { btns[i].click(); return true; }
+            if ((btns[i].textContent || '').trim().toLowerCase() === 'create' && !btns[i].disabled) {
+              btns[i].click(); return 'text';
+            }
           }
-          return false;
+          return primary.length > 1 ? 'ambiguous-primary' : 'not-found';
         })()
       `);
-      if (!created) throw new Error('Create button not found or still disabled in the layout dialog.');
+      if (created !== 'primary' && created !== 'text') {
+        throw new Error(`Confirm button not usable in the layout form (${created}).`);
+      }
       return layoutName;
     }
     const clickByTitle = `

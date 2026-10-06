@@ -4,6 +4,15 @@
  * They throw on error (callers catch and format).
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
+import { createHash } from 'node:crypto';
+import {
+  beginTransaction,
+  markSourceReplaced,
+  verifyAfterWrite,
+  markSaveDispatched,
+  verifyAfterSave,
+  consumeTransaction,
+} from './pine_transaction.js';
 import {
   addedPersistentScriptIds,
   configuredProtectedScriptIds,
@@ -1110,5 +1119,127 @@ export async function listScripts({ _deps = {} } = {}) {
     scripts,
     count: scripts.length,
     source: 'internal_api',
+  };
+}
+
+
+// ── Bounded source-replacement transaction ──────────────────────────────────────
+//
+// setSource() and save() are deliberately NOT changed by this. They still demand a
+// PROVEN pre-write identity on every call, which is correct for ordinary edits.
+//
+// This operation exists for the one case they cannot express: replacing a script's
+// entire source. The pre-write proof available here requires the buffer to equal the
+// saved revision, and a full replacement destroys that equality, so setSource would
+// pass and the following save would be refused IDENTITY_UNPROVEN. See
+// src/core/pine_transaction.js for the reasoning and the state machine.
+//
+// Authority comes from ONE strong pre-write proof, carried through exactly one
+// replace/save cycle under checks that do not depend on the old content: same CDP
+// target, same persistent id and name, no new script id, buffer digest equals the
+// intended source, protected set unchanged, short TTL, single use. After the save the
+// ordinary PROVEN binding must be restored, so the transaction hands authority back
+// rather than keeping it.
+
+const sha256 = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
+
+export async function replaceBoundSource({
+  source, expected_script_id, target_id, _deps = {},
+} = {}) {
+  const deps = dependencies(_deps);
+  if (!source) throw new Error('source is required');
+  if (!expected_script_id) throw new Error('expected_script_id is required');
+
+  const editorReady = await deps.ensurePineEditorOpen();
+  if (!editorReady) throw new Error('Could not open Pine Editor.');
+
+  const intendedDigest = sha256(source);
+  const fail = (stage, result, txn) => {
+    if (txn) consumeTransaction({ txn, outcome: 'FAILED' });
+    return {
+      success: false, stage, reason: result.reason, detail: result.detail ?? null,
+      no_mutation: stage === 'begin', expected_script_id,
+      intended_digest: intendedDigest,
+    };
+  };
+
+  // ── prove identity once, the strong way ──
+  const identity = await deps.getBoundIdentity({ expected_script_id, _deps });
+  const inventory = await deps.listPersistentScripts({ _deps });
+  const entry = inventory.find(x => (x.script_id ?? x.id) === expected_script_id);
+  const persistedBefore = await deps.readSavedSource({
+    scriptId: expected_script_id, revision: entry?.revision ?? null, _deps,
+  });
+
+  const begun = beginTransaction({
+    identity,
+    inventory,
+    expectedScriptId: expected_script_id,
+    protectedIds: deps.protectedIds,
+    targetId: target_id,
+    persistedDigest: persistedBefore === undefined ? null : sha256(persistedBefore),
+    intendedDigest,
+  });
+  if (!begun.ok) return fail('begin', begun, null);
+  const { txn } = begun;
+
+  // ── replace the source ──
+  const set = await setSource({ source, expected_script_id, _deps });
+  if (!set?.success) return fail('set_source', { reason: set?.reason || 'SET_SOURCE_FAILED' }, txn);
+  const replaced = markSourceReplaced({ txn });
+  if (!replaced.ok) return fail('mark_replaced', replaced, txn);
+
+  // ── verify what is in the buffer, not what used to be ──
+  const afterWriteState = await deps.readEditorBindingState({ _deps });
+  const afterWriteIdentity = await deps.getBoundIdentity({ expected_script_id, _deps });
+  const invAfterWrite = await deps.listPersistentScripts({ _deps });
+  const verified = verifyAfterWrite({
+    txn,
+    identity: afterWriteIdentity,
+    inventory: invAfterWrite,
+    targetId: target_id,
+    bufferDigest: typeof afterWriteState?.source === 'string' ? sha256(afterWriteState.source) : null,
+    protectedIds: deps.protectedIds,
+  });
+  if (!verified.ok) return fail('verify_after_write', verified, txn);
+
+  // ── save, authorized by the transaction rather than by the consumed proof ──
+  const dispatched = markSaveDispatched({ txn });
+  if (!dispatched.ok) return fail('mark_save', dispatched, txn);
+
+  const c = await deps.getClient();
+  await c.Input.dispatchKeyEvent({
+    type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83,
+  });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
+  await deps.sleep(2500);
+
+  // ── verify persistence ──
+  const invAfterSave = await deps.listPersistentScripts({ _deps });
+  const entryAfter = invAfterSave.find(x => (x.script_id ?? x.id) === expected_script_id);
+  const persistedAfter = await deps.readSavedSource({
+    scriptId: expected_script_id, revision: entryAfter?.revision ?? null, _deps,
+  });
+  const identityAfter = await deps.getBoundIdentity({ expected_script_id, _deps });
+  const settled = verifyAfterSave({
+    txn,
+    identity: identityAfter,
+    inventory: invAfterSave,
+    persistedDigest: typeof persistedAfter === 'string' ? sha256(persistedAfter) : null,
+  });
+  if (!settled.ok) return fail('verify_after_save', settled, txn);
+
+  consumeTransaction({ txn, outcome: 'COMPLETE' });
+  return {
+    success: true,
+    expected_script_id,
+    persistent_id_unchanged: true,
+    revision_before: txn.persistentRevision,
+    revision_after: entryAfter?.revision ?? null,
+    intended_digest: intendedDigest,
+    persisted_digest: sha256(persistedAfter),
+    digest_match: true,
+    identity_restored: identityAfter.identity_confidence,
+    transaction_state: txn.state,
   };
 }

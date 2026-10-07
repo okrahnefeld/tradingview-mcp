@@ -84,10 +84,49 @@ export async function ensurePineEditorOpen({ _deps = {} } = {}) {
     })()
   `);
 
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 25; i++) {
     await _sleep(200);
     const ready = await _evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
     if (ready) return true;
+  }
+
+  // Last resort: real CDP mouse input on the Pine Editor toolbar button.
+  //
+  // Current TradingView Desktop builds ignore HTMLElement.click() for this button, and
+  // expose none of the data-name hooks used above -- they use data-qa-id instead. That
+  // combination leaves every structured Pine operation reporting "Could not open Pine
+  // Editor" on a correctly configured host. Upstream PR #415 diagnosed the same thing
+  // and the fix is to dispatch input a real user click would produce.
+  //
+  // This is additive: it runs only after the API and synthetic-click paths have already
+  // failed, so no existing behaviour changes.
+  const button = await _evaluate(`
+    (function() {
+      function visible(el) {
+        if (!el || !el.isConnected) return false;
+        var r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      }
+      var b = Array.prototype.slice.call(document.querySelectorAll('[data-qa-id="scripteditor"]')).find(visible);
+      if (!b) return null;
+      var r = b.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    })()
+  `);
+  if (button && typeof button.x === 'number') {
+    const c = await (_deps.getClient || getClient)();
+    await c.Input.dispatchMouseEvent({ type: 'mouseMoved', x: button.x, y: button.y });
+    await c.Input.dispatchMouseEvent({
+      type: 'mousePressed', x: button.x, y: button.y, button: 'left', buttons: 1, clickCount: 1,
+    });
+    await c.Input.dispatchMouseEvent({
+      type: 'mouseReleased', x: button.x, y: button.y, button: 'left', buttons: 0, clickCount: 1,
+    });
+    for (let i = 0; i < 40; i++) {
+      await _sleep(200);
+      const ready = await _evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+      if (ready) return true;
+    }
   }
   return false;
 }

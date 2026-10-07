@@ -182,8 +182,43 @@ async function readEditorBindingState({ _deps = {} } = {}) {
   const _evaluate = _deps.evaluate || evaluate;
   return _evaluate(`
     (function() {
+      // Read the host's authoritative active-script slot FIRST. It is available on builds
+      // where the Monaco container is mounted detached with no reachable React fibers,
+      // which is exactly when every other signal here goes blind.
+      var hostActive = null;
+      try {
+        var pea0 = window.TradingViewApi && window.TradingViewApi.pineEditorApi;
+        var fac0 = pea0 ? (pea0().getDialogFacade() || pea0().getBottomFacade()) : null;
+        if (fac0 && typeof fac0.getScriptIdVersion === 'function') {
+          var idv0 = fac0.getScriptIdVersion();
+          if (idv0 && idv0.scriptIdPart) {
+            hostActive = {
+              id: String(idv0.scriptIdPart),
+              version: idv0.version == null ? null : String(idv0.version),
+              modified: (typeof fac0.isModified === 'function') ? !!fac0.isModified() : null,
+              draft: (typeof fac0.isDraft === 'function') ? !!fac0.isDraft() : null
+            };
+          }
+        }
+      } catch (_) { /* absent on this build */ }
+
       var monaco = ${FIND_MONACO};
-      if (!monaco) return { editor_visible: false, binding_candidates: [] };
+      if (!monaco) {
+        // No reachable editor DOM. If the host still names an active script, report that
+        // single candidate rather than going blind; everything downstream still requires
+        // it to resolve uniquely in persistent inventory.
+        if (hostActive) {
+          return {
+            editor_visible: true,
+            source: undefined,
+            visible_title: null,
+            dirty_hint: hostActive.modified === true,
+            host_active_script: hostActive,
+            binding_candidates: [{ id: hostActive.id, source: 'host_active_script' }]
+          };
+        }
+        return { editor_visible: false, binding_candidates: [] };
+      }
       var model = monaco.editor.getModel ? monaco.editor.getModel() : null;
       var container = document.querySelector('.monaco-editor.pine-editor-monaco');
       var candidates = [];
@@ -202,6 +237,11 @@ async function readEditorBindingState({ _deps = {} } = {}) {
           if (!seen[key]) { candidates.push({ id: matches[i], source: source }); seen[key] = true; }
         }
       }
+
+      // The hoisted host readback is the authoritative slot; register it as a candidate.
+      // It is deliberately NOT the recently-used list, which carries ids whether or not
+      // the script is open and would manufacture false positives.
+      if (hostActive) addCandidate(hostActive.id, 'host_active_script');
 
       if (model && model.uri) addCandidate(String(model.uri), 'monaco_model_uri');
       var node = container;
@@ -268,6 +308,7 @@ async function readEditorBindingState({ _deps = {} } = {}) {
         model_uri: model && model.uri ? String(model.uri) : null,
         visible_title: visibleTitle,
         dirty_hint: dirtyHint,
+        host_active_script: hostActive,
         binding_candidates: candidates
       };
     })()
